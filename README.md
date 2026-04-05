@@ -19,7 +19,7 @@ A lightweight, professional chat UI for running `mlx-community` vision-language 
 
 ## Requirements
 
-- macOS with Apple Silicon (M1 / M2 / M3 / M4)
+- macOS with Apple Silicon (M1 / M2 / M3 / M4 / M5)
 - Python 3.11 or later
 - Internet connection (first run, to download models)
 
