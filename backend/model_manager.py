@@ -105,6 +105,9 @@ _VISION_TAG_HINTS = {
     "vlm",
 }
 
+# Model types known to fail in mlx_vlm loading path.
+_UNSUPPORTED_MODEL_TYPES = set()
+
 
 def _publisher_from_base_models(base_models: Any) -> Optional[str]:
     """Extract publisher from the HF baseModels expand field."""
@@ -138,6 +141,16 @@ def _has_vision(tags: List[str], name: str = "") -> bool:
     name_l = (name or "").lower()
     name_hints = ("-vl", "vision", "internvl", "llava", "moondream", "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl")
     return any(h in name_l for h in name_hints)
+
+
+def _compatibility_from_model_type(model_type: Optional[str]) -> Dict[str, Any]:
+    mt = (model_type or "").strip().lower()
+    if mt in _UNSUPPORTED_MODEL_TYPES:
+        return {
+            "loadable": False,
+            "reason": f"Model type '{model_type}' is not supported by mlx_vlm in this app.",
+        }
+    return {"loadable": True, "reason": None}
 
 
 # ── Size estimation ───────────────────────────────────────────────────────────
@@ -213,12 +226,13 @@ def get_model_capabilities(model_id: str) -> Dict[str, Any]:
 
     tags: List[str] = []
     pipeline_tag = None
+    model_type = None
     vision = False
 
     try:
         resp = requests.get(
             f"{_HF_API}/{model_id}",
-            params={"expand[]": ["tags", "pipeline_tag"]},
+            params={"expand[]": ["tags", "pipeline_tag", "config"]},
             timeout=8,
             headers={"User-Agent": "mlx-chat/1.0"},
         )
@@ -226,15 +240,20 @@ def get_model_capabilities(model_id: str) -> Dict[str, Any]:
         data = resp.json()
         tags = list(data.get("tags") or [])
         pipeline_tag = data.get("pipeline_tag")
+        model_type = (data.get("config") or {}).get("model_type")
         if pipeline_tag:
             tags.append(str(pipeline_tag))
     except Exception:
         pass
 
     vision = _has_vision(tags, model_id)
+    compat = _compatibility_from_model_type(model_type)
     result = {
         "model_id": model_id,
         "vision": vision,
+        "model_type": model_type,
+        "loadable": compat["loadable"],
+        "reason": compat["reason"],
         "tags": sorted(set(tags), key=lambda x: str(x).lower())[:16],
     }
 
@@ -295,6 +314,9 @@ def list_local_models() -> List[Dict[str, Any]]:
             "size_gb":   round(size_gb, 2),
             "gpu_label": _gpu_label(size_gb),
             "vision":    vision,
+            "model_type": caps.get("model_type"),
+            "loadable": bool(caps.get("loadable", True)),
+            "reason": caps.get("reason"),
         })
     return results
 
@@ -339,6 +361,7 @@ def search_models(query: str = "", sort: str = "downloads", limit: int = 30) -> 
         ("direction", -1),
         ("limit",     limit),
         ("expand[]",  "baseModels"),
+        ("expand[]",  "config"),
         ("expand[]",  "lastModified"),
         ("expand[]",  "pipeline_tag"),
     ]
@@ -383,6 +406,8 @@ def search_models(query: str = "", sort: str = "downloads", limit: int = 30) -> 
         tags = [str(t) for t in (m.get("tags") or [])[:12]]
         if m.get("pipeline_tag"):
             tags.append(str(m.get("pipeline_tag")))
+        model_type = (m.get("config") or {}).get("model_type")
+        compat = _compatibility_from_model_type(model_type)
         vision = _has_vision(tags, name)
 
         results.append({
@@ -397,6 +422,9 @@ def search_models(query: str = "", sort: str = "downloads", limit: int = 30) -> 
             "publisher":     publisher,
             "tags":          sorted(set(tags), key=lambda x: x.lower())[:8],
             "vision":        vision,
+            "model_type":    model_type,
+            "loadable":      compat["loadable"],
+            "reason":        compat["reason"],
         })
     return results
 

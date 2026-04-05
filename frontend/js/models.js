@@ -44,6 +44,12 @@ function renderTagChips(model) {
   return chips.join("");
 }
 
+function unsupportedChip(model) {
+  if (model?.loadable !== false) return "";
+  const title = escHtml(model.reason || "Unsupported by current loader");
+  return `<span class="gpu-badge too_large" title="${title}">Unsupported</span>`;
+}
+
 // ── Memory info ────────────────────────────────────────────────────────────────
 async function refreshMemoryInfo() {
   try {
@@ -90,16 +96,23 @@ function buildLocalCard(m) {
       <div class="model-card-meta">
         <span class="model-card-size">${fmtSize(m.size_gb, false)}</span>
         ${gpuBadge(m.gpu_label)}
+        ${unsupportedChip(m)}
         ${loaded ? '<span class="gpu-badge full">Loaded</span>' : ""}
       </div>
       <div class="model-tag-row">${renderTagChips(m)}</div>
     </div>
     <div class="model-card-actions">
       <button class="btn-outline btn-load-local" data-id="${m.id}">
-        ${loaded ? "Loaded" : "Load"}
+        ${loaded ? "Loaded" : (m.loadable === false ? "Unsupported" : "Load")}
       </button>
       <button class="btn-danger btn-delete-local" data-id="${m.id}">Delete</button>
     </div>`;
+
+  if (m.loadable === false) {
+    const loadBtn = card.querySelector(".btn-load-local");
+    loadBtn.disabled = true;
+    loadBtn.title = m.reason || "Unsupported by current loader";
+  }
 
   card.querySelector(".btn-load-local").addEventListener("click", async e => {
     const btn = e.currentTarget;
@@ -315,6 +328,7 @@ function buildSearchCard(m, alreadyLocal) {
       <div class="model-card-meta">
         <span class="model-card-size size-display">${sizeStr}</span>
         <span class="gpu-badge ${m.gpu_label} gpu-badge-dynamic">${GPU_LABELS[m.gpu_label] || ""}</span>
+        ${unsupportedChip(m)}
         ${m.publisher ? `<span class="publisher-badge">${escHtml(m.publisher)}</span>` : ""}
         <span class="model-card-size">${downloads}</span>
       </div>
@@ -323,10 +337,12 @@ function buildSearchCard(m, alreadyLocal) {
     <div class="model-card-actions" id="actions-${CSS.escape(m.id)}">
       ${alreadyLocal
         ? '<span class="gpu-badge full">Downloaded</span>'
-        : `<button class="btn-primary btn-sm btn-download" data-id="${m.id}">Download</button>`}
+        : (m.loadable === false
+            ? `<button class="btn-outline btn-sm" title="${escHtml(m.reason || 'Unsupported by current loader')}" disabled>Unsupported</button>`
+            : `<button class="btn-primary btn-sm btn-download" data-id="${m.id}">Download</button>`)}
     </div>`;
 
-  if (!alreadyLocal) {
+  if (!alreadyLocal && m.loadable !== false) {
     card.querySelector(".btn-download").addEventListener("click", async e => {
       const btn = e.currentTarget;
       btn.disabled = true;

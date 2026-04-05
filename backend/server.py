@@ -114,7 +114,12 @@ def get_last_model():
 async def load_model(req: LoadRequest):
     loop = asyncio.get_event_loop()
     try:
-        await loop.run_in_executor(_thread_pool, lambda: mlx.load_model(req.model_id))
+        caps = await loop.run_in_executor(_thread_pool, lambda: mm.get_model_capabilities(req.model_id))
+        if not caps.get("loadable", True):
+            raise HTTPException(status_code=400, detail=caps.get("reason") or "Model is not supported in this app.")
+
+        backend = "vlm" if caps.get("vision") else "lm"
+        await loop.run_in_executor(_thread_pool, lambda: mlx.load_model(req.model_id, backend=backend))
         cfg.set_last_model(req.model_id)
         return {"status": "loaded", "model_id": req.model_id}
     except Exception as e:
