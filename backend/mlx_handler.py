@@ -7,12 +7,57 @@ import gc
 from typing import Generator, List, Dict, Any, Optional
 
 _lock = threading.Lock()
+_cleanup_lock = threading.Lock()
+_cleanup_thread: Optional[threading.Thread] = None
 _current_model_id: Optional[str] = None
 _model = None
 _processor = None
 _config = None
 _backend_type: Optional[str] = None  # "vlm" | "lm"
 _load_status: Dict[str, Any] = {"state": "idle", "message": ""}
+
+
+def _release_runtime_memory() -> None:
+    """Best-effort memory release for Python + MLX caches.
+
+    This is intentionally defensive because different MLX versions expose
+    different cache APIs.
+    """
+    gc.collect()
+    try:
+        import mlx.core as mx
+        mx.clear_cache()
+    except Exception:
+        # Cleanup is best-effort; model management should not fail here.
+        pass
+
+    # A second pass often helps reclaim cycles/finalizers from old model graphs.
+    gc.collect()
+
+
+def _run_background_cleanup() -> None:
+    global _cleanup_thread
+    try:
+        with _cleanup_lock:
+            _release_runtime_memory()
+    finally:
+        _cleanup_thread = None
+
+
+def _schedule_runtime_memory_release() -> None:
+    global _cleanup_thread
+    with _cleanup_lock:
+        existing = _cleanup_thread
+        if existing is not None and existing.is_alive():
+            return
+
+        thread = threading.Thread(
+            target=_run_background_cleanup,
+            name="mlx-background-cleanup",
+            daemon=True,
+        )
+        _cleanup_thread = thread
+        thread.start()
 
 
 def get_load_status() -> Dict[str, Any]:
@@ -35,12 +80,17 @@ def load_model(model_id: str, backend: Optional[str] = None) -> None:
         if _current_model_id == model_id and _model is not None:
             return
 
+        switching_models = _model is not None and _current_model_id != model_id
+        if switching_models:
+            _load_status = {"state": "loading", "message": f"Releasing memory from {_current_model_id}..."}
+
         _load_status = {"state": "loading", "message": f"Loading {model_id}..."}
         _model = None
         _processor = None
         _config = None
         _backend_type = None
         _current_model_id = None
+        _release_runtime_memory()
 
         try:
             selected_backend = backend or "vlm"
@@ -75,7 +125,7 @@ def load_model(model_id: str, backend: Optional[str] = None) -> None:
             raise
 
 
-def unload_model() -> None:
+def unload_model(background_gc: bool = False) -> None:
     global _current_model_id, _model, _processor, _config, _backend_type, _load_status
     with _lock:
         _model = None
@@ -84,16 +134,13 @@ def unload_model() -> None:
         _backend_type = None
         _current_model_id = None
 
-        # Force Python/MLX cleanup so resident memory drops sooner.
-        gc.collect()
-        try:
-            import mlx.core as mx
-            mx.clear_cache()
-        except Exception:
-            # Cleanup is best-effort; unload should still succeed.
-            pass
-
         _load_status = {"state": "idle", "message": ""}
+
+    if background_gc:
+        _schedule_runtime_memory_release()
+    else:
+        # Force Python/MLX cleanup so resident memory drops sooner.
+        _release_runtime_memory()
 
 
 def _build_lm_prompt(tokenizer: Any, messages: List[Dict[str, Any]]) -> str:

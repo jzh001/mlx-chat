@@ -362,8 +362,11 @@ def search_models(query: str = "", sort: str = "downloads", limit: int = 30) -> 
         ("limit",     limit),
         ("expand[]",  "baseModels"),
         ("expand[]",  "config"),
+        ("expand[]",  "downloads"),
+        ("expand[]",  "likes"),
         ("expand[]",  "lastModified"),
         ("expand[]",  "pipeline_tag"),
+        ("expand[]",  "tags"),
     ]
     if query:
         params.append(("search", query))

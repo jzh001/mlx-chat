@@ -260,6 +260,74 @@ select:focus { outline: none; border-color: var(--accent); }
   flex: 1;
   min-width: 0;
   padding-top: 4px;
+  position: relative;
+}
+
+.message-copy-btn {
+  position: absolute;
+  top: 0;
+  right: 0;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted);
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 3px 8px;
+  cursor: pointer;
+}
+
+.message-copy-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.message.user .message-content > :not(.message-copy-btn) {
+  padding-right: 54px;
+}
+
+.reasoning-block {
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.02);
+  overflow: hidden;
+}
+
+.reasoning-block summary {
+  list-style: none;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 8px 10px;
+  user-select: none;
+  position: relative;
+}
+
+.reasoning-block summary::-webkit-details-marker {
+  display: none;
+}
+
+.reasoning-block summary::after {
+  content: "+";
+  position: absolute;
+  right: 10px;
+  top: 8px;
+  color: var(--text-subtle);
+}
+
+.reasoning-block[open] summary::after {
+  content: "-";
+}
+
+.reasoning-content {
+  border-top: 1px solid var(--border);
+  padding: 10px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.final-content:empty {
+  min-height: 1em;
 }
 
 /* Markdown styles inside messages */
@@ -292,10 +360,28 @@ select:focus { outline: none; border-color: var(--accent); }
 .message-content pre {
   background: var(--code-bg);
   border-radius: var(--radius-sm);
-  padding: 14px 16px;
+  padding: 34px 16px 14px;
   overflow-x: auto;
   margin: 0.75em 0;
   position: relative;
+}
+
+.code-copy-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  border: 1px solid var(--border);
+  background: rgba(0, 0, 0, 0.35);
+  color: var(--text-muted);
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.code-copy-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
 }
 .message-content pre code {
   background: none;
@@ -316,6 +402,18 @@ select:focus { outline: none; border-color: var(--accent); }
 .message-content th { background: var(--surface); font-weight: 600; }
 .message-content a { color: var(--accent); text-decoration: none; }
 .message-content a:hover { text-decoration: underline; }
+.message-content .math-display {
+  margin: 0.9em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.message-content .math-inline {
+  display: inline-block;
+  max-width: 100%;
+}
+.message-content .katex-display {
+  margin: 0.2em 0;
+}
 
 /* Generation statistics bar */
 .msg-stats {

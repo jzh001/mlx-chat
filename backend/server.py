@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+from time import monotonic
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -19,6 +20,8 @@ from sse_starlette.sse import EventSourceResponse
 _thread_pool = ThreadPoolExecutor(max_workers=4)
 _stop_events_lock = threading.Lock()
 _stop_events: Dict[str, threading.Event] = {}
+_deleted_conversations_lock = threading.Lock()
+_deleted_conversations: set[str] = set()
 
 from . import config as cfg
 from . import mlx_handler as mlx
@@ -36,6 +39,39 @@ app.add_middleware(
 )
 
 app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+
+def _mark_conversation_deleted(conv_id: str) -> None:
+    with _deleted_conversations_lock:
+        _deleted_conversations.add(conv_id)
+
+
+def _is_conversation_deleted(conv_id: Optional[str]) -> bool:
+    if not conv_id:
+        return False
+    with _deleted_conversations_lock:
+        return conv_id in _deleted_conversations
+
+
+@app.on_event("shutdown")
+def _shutdown_runtime_resources():
+    # Ensure executors and stop flags are released on app shutdown.
+    global _thread_pool
+
+    # First signal active streams to stop.
+    with _stop_events_lock:
+        for ev in _stop_events.values():
+            ev.set()
+        _stop_events.clear()
+
+    # Drop model references immediately and release caches in the background.
+    if mlx.get_loaded_model() is not None:
+        mlx.unload_model(background_gc=True)
+
+    try:
+        _thread_pool.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
 
 
 @app.get("/")
@@ -174,8 +210,42 @@ def get_conversation(conv_id: str):
 
 @app.delete("/api/conversations/{conv_id}")
 def delete_conversation(conv_id: str):
+    _mark_conversation_deleted(conv_id)
     ok = cfg.delete_conversation(conv_id)
     return {"deleted": ok}
+
+
+class DraftConversationRequest(BaseModel):
+    conversation_id: Optional[str] = None
+    model_id: str
+    messages: List[Dict[str, Any]]
+
+
+@app.post("/api/conversations/draft")
+def save_conversation_draft(req: DraftConversationRequest):
+    now = datetime.now(timezone.utc).isoformat()
+    conv_id = req.conversation_id or str(uuid.uuid4())
+
+    if _is_conversation_deleted(conv_id):
+        return {"conversation_id": conv_id, "status": "deleted"}
+
+    user_messages = [m for m in req.messages if m.get("role") == "user"]
+    title = "Chat"
+    if user_messages:
+        first_content = (user_messages[0].get("content") or "").strip()
+        title = first_content[:60] if first_content else "Image chat"
+
+    existing = cfg.load_conversation(conv_id) or {}
+    conv = {
+        "id": conv_id,
+        "model": req.model_id,
+        "created_at": existing.get("created_at", now),
+        "updated_at": now,
+        "title": title,
+        "messages": list(req.messages),
+    }
+    cfg.save_conversation(conv)
+    return {"conversation_id": conv_id, "status": "saved"}
 
 
 # ── Chat streaming ────────────────────────────────────────────────────────────
@@ -190,6 +260,12 @@ class ChatRequest(BaseModel):
 
 class StopRequest(BaseModel):
     request_id: str
+
+
+REASONING_TAG_HINT = (
+    "If you include internal reasoning, wrap it strictly in <thinking>...</thinking>. "
+    "Put the final user-facing answer outside those tags."
+)
 
 
 def _decode_data_url_image(data_url: str):
@@ -255,6 +331,11 @@ async def chat_stream(req: ChatRequest, request: Request):
     if settings.get("system_prompt") and not any(m.get("role") == "system" for m in model_messages):
         model_messages = [{"role": "system", "content": settings["system_prompt"]}] + model_messages
 
+    # Optional last-resort fallback for models that do not naturally emit explicit
+    # reasoning boundaries. Off by default.
+    if settings.get("enforce_thinking_tags"):
+        model_messages = [{"role": "system", "content": REASONING_TAG_HINT}] + model_messages
+
     conv_id = req.conversation_id or str(uuid.uuid4())
     req_id = req.request_id or str(uuid.uuid4())
     stop_event = threading.Event()
@@ -270,12 +351,19 @@ async def chat_stream(req: ChatRequest, request: Request):
             pil_image = _decode_data_url_image(image_data_url) if image_data_url else None
             num_images = 1 if pil_image is not None else 0
 
+            # Guard against malformed client values and keep explicit bounds.
+            try:
+                max_tokens = int(settings.get("max_tokens", 2048))
+            except Exception:
+                max_tokens = 2048
+            max_tokens = max(64, min(max_tokens, 131072))
+
             def _stream():
                 return mlx.stream_chat(
                     messages=model_messages,
                     temperature=float(settings.get("temperature", 0.7)),
                     top_p=float(settings.get("top_p", 0.9)),
-                    max_tokens=int(settings.get("max_tokens", 2048)),
+                    max_tokens=max_tokens,
                     repetition_penalty=float(settings.get("repetition_penalty", 1.1)),
                     repetition_context_size=int(settings.get("repetition_context_size", 20)),
                     use_turboquant=bool(settings.get("use_turboquant", False)),
@@ -309,9 +397,16 @@ async def chat_stream(req: ChatRequest, request: Request):
                 reader_future = pool.submit(_reader)
 
                 gen_stats = None
+                disconnected_since = None
                 while True:
                     if await request.is_disconnected():
-                        stop_event.set()
+                        if disconnected_since is None:
+                            disconnected_since = monotonic()
+                        elif monotonic() - disconnected_since > 3.0:
+                            # Brief disconnects can happen when switching tabs/views.
+                            stop_event.set()
+                    else:
+                        disconnected_since = None
 
                     kind, data = await chunk_queue.get()
                     if kind == "chunk":
@@ -354,15 +449,16 @@ async def chat_stream(req: ChatRequest, request: Request):
         if full_text.strip():
             all_messages.append({"role": "assistant", "content": full_text})
 
-        conv = cfg.load_conversation(conv_id) or {
-            "id": conv_id,
-            "model": req.model_id,
-            "created_at": now,
-        }
-        conv["title"] = title
-        conv["messages"] = all_messages
-        conv["updated_at"] = now
-        cfg.save_conversation(conv)
+        if not _is_conversation_deleted(conv_id):
+            conv = cfg.load_conversation(conv_id) or {
+                "id": conv_id,
+                "model": req.model_id,
+                "created_at": now,
+            }
+            conv["title"] = title
+            conv["messages"] = all_messages
+            conv["updated_at"] = now
+            cfg.save_conversation(conv)
 
         if stopped:
             yield {"data": json.dumps({"type": "stopped"})}

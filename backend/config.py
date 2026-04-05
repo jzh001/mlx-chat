@@ -17,6 +17,7 @@ DEFAULT_SETTINGS = {
     "repetition_penalty": 1.1,
     "repetition_context_size": 20,
     "system_prompt": "",
+    "enforce_thinking_tags": False,
     "use_turboquant": False,
     "kv_bits": 4.0,
 }

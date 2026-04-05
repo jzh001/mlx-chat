@@ -19,6 +19,254 @@ function renderMarkdown(text) {
   return marked.parse(text);
 }
 
+function escapeHtml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function normalizeMathText(text) {
+  let out = String(text || "");
+
+  const unwrapEscapedLatex = (expr) => (
+    String(expr || "")
+      // Models often double-escape LaTeX commands in streamed/plain-text output.
+      .replace(/\\\\([A-Za-z]+)/g, "\\$1")
+      .replace(/\\\\([{}_^])/g, "\\$1")
+  );
+
+  const wrapBareLatexParens = (source) => (
+    String(source || "").replace(/\(([^()\n]*\\[A-Za-z]+[^()\n]*)\)/g, (whole, inner) => {
+      const expr = unwrapEscapedLatex(inner).trim();
+      if (!expr) return whole;
+      return `\\(${expr}\\)`;
+    })
+  );
+
+  const repairLatexMatrices = (expr) => {
+    const src = String(expr || "");
+
+    return src.replace(
+      /\\begin\{((?:b|p|v|V|B|small)?matrix)\}([\s\S]*?)\\end\{\1\}/g,
+      (whole, envName, inner) => {
+        const prepared = String(inner || "")
+          // Common model shorthand uses | or ; to separate rows.
+          .replace(/\\\\/g, "\n")
+          .replace(/\s*[|;]\s*/g, "\n");
+
+        const lines = prepared
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0);
+
+        if (lines.length < 2) {
+          return whole;
+        }
+
+        // Normalize row endings. Many model outputs use a single trailing
+        // backslash per row, which is invalid in LaTeX matrices.
+        const normalizedLines = lines.map((line, idx) => {
+          const row = line.replace(/(?:\\\\|\\)\s*$/, "").trim();
+          return idx < lines.length - 1 ? `${row} \\\\` : row;
+        });
+
+        return `\\begin{${envName}}\n${normalizedLines.join("\n")}\n\\end{${envName}}`;
+      },
+    );
+  };
+
+  // Some models emit display math as a standalone [ ... ] block.
+  // Normalize that to $$...$$ so KaTeX reliably renders it.
+  out = out.replace(/(^|\n)\s*\[\s*\n([\s\S]*?)\n\s*\](?=\n|$)/g, (m, lead, body) => {
+    return `${lead}$$\n${body}\n$$`;
+  });
+
+  // Normalize common doubly-escaped math delimiters from JSON/plain-text output.
+  out = out
+    .replace(/\\\$/g, "$")
+    .replace(/\\\\\(/g, "\\(")
+    .replace(/\\\\\)/g, "\\)")
+    .replace(/\\\\\[/g, "\\[")
+    .replace(/\\\\\]/g, "\\]");
+
+  // Promote plain parenthesized LaTeX fragments like (\Sigma) or (m \times n)
+  // into actual inline math so KaTeX can render them.
+  out = wrapBareLatexParens(out);
+
+  // Convert compact numeric matrix shorthand to KaTeX matrix syntax.
+  // Examples:
+  //   (1 2 3 4)        -> \begin{bmatrix}1 & 2 \\ 3 & 4\end{bmatrix}
+  //   (1 2; 3 4)       -> \begin{bmatrix}1 & 2 \\ 3 & 4\end{bmatrix}
+  // This runs only inside math delimiters to avoid changing plain text prose.
+  const toMatrixLatex = (expr) => {
+    const isNum = (s) => /^[-+]?\d*\.?\d+(?:e[-+]?\d+)?$/i.test(s);
+
+    const matrixFromBody = (whole, body) => {
+      const src = String(body || "").trim();
+      if (!src) return whole;
+      if (/\\begin\s*\{(?:b|p|v|V|B|small)?matrix\}/i.test(src)) return whole;
+
+      let rows = [];
+      const splitByRows = /[;|]/.test(src)
+        ? src.split(/[;|]/)
+        : (src.includes("\n") ? src.split(/\n+/) : [src]);
+
+      for (const row of splitByRows) {
+        const tokens = row.trim().split(/[\s,]+/).filter(Boolean);
+        if (!tokens.length || !tokens.every(isNum)) {
+          return whole;
+        }
+        rows.push(tokens);
+      }
+
+      if (rows.length === 1) {
+        const tokens = rows[0];
+        if (tokens.length < 4) return whole;
+
+        const side = Math.sqrt(tokens.length);
+        if (Number.isInteger(side)) {
+          rows = [];
+          for (let i = 0; i < tokens.length; i += side) {
+            rows.push(tokens.slice(i, i + side));
+          }
+        } else if (tokens.length % 2 === 0) {
+          // Prefer two rows for flat even-length numeric lists like [7 0 0 2.1 0 0].
+          const width = tokens.length / 2;
+          rows = [tokens.slice(0, width), tokens.slice(width)];
+        } else {
+          return whole;
+        }
+      }
+
+      const width = rows[0].length;
+      if (!width || !rows.every((r) => r.length === width)) return whole;
+
+      const matrixBody = rows.map((r) => r.join(" & ")).join(" \\\\ ");
+      return `\\begin{bmatrix}${matrixBody}\\end{bmatrix}`;
+    };
+
+    let outExpr = String(expr || "").replace(/\(([^()]+)\)/g, matrixFromBody);
+    outExpr = outExpr.replace(/\[([^\[\]]+)\]/g, matrixFromBody);
+    return outExpr;
+  };
+
+  const normalizeMathExpr = (expr) => {
+    const unescaped = unwrapEscapedLatex(expr);
+    return repairLatexMatrices(toMatrixLatex(unescaped));
+  };
+
+  out = out.replace(/\$\$([\s\S]*?)\$\$/g, (m, expr) => `$$${normalizeMathExpr(expr)}$$`);
+  out = out.replace(/\\\[([\s\S]*?)\\\]/g, (m, expr) => `\\[${normalizeMathExpr(expr)}\\]`);
+  out = out.replace(/\\\(([\s\S]*?)\\\)/g, (m, expr) => `\\(${normalizeMathExpr(expr)}\\)`);
+
+  return out;
+}
+
+function normalizeInlineDollarMath(text) {
+  const source = String(text || "");
+  let out = "";
+  let i = 0;
+
+  while (i < source.length) {
+    const ch = source[i];
+    if (ch !== "$") {
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    // Leave display math intact for the dedicated block handler.
+    if (source[i + 1] === "$") {
+      out += "$$";
+      i += 2;
+      continue;
+    }
+
+    let j = i + 1;
+    let found = -1;
+    while (j < source.length) {
+      if (source[j] === "$" && source[j - 1] !== "\\") {
+        found = j;
+        break;
+      }
+      if (source[j] === "\n") {
+        break;
+      }
+      j += 1;
+    }
+
+    if (found === -1) {
+      out += ch;
+      i += 1;
+      continue;
+    }
+
+    const expr = source.slice(i + 1, found).trim();
+    if (!expr) {
+      out += "$$";
+      i = found + 1;
+      continue;
+    }
+
+    out += `\\(${expr}\\)`;
+    i = found + 1;
+  }
+
+  return out;
+}
+
+function stashMathSegments(text) {
+  let out = String(text || "");
+  const placeholders = [];
+
+  const stash = (mode, raw) => {
+    const idx = placeholders.length;
+    placeholders.push({ token: `MLXCHATMATH${idx}TOKEN`, mode, raw });
+    return placeholders[idx].token;
+  };
+
+  out = out.replace(/(^|\n)\s*\$\$\s*([\s\S]*?)\s*\$\$(?=\s*(?:\n|$))/g, (m, lead, expr) => {
+    const body = String(expr || "").trim();
+    if (!body) return m;
+    return `${lead}${stash("display", `$$${body}$$`)}`;
+  });
+
+  out = out.replace(/(^|\n)\s*\\\[\s*([\s\S]*?)\s*\\\](?=\s*(?:\n|$))/g, (m, lead, expr) => {
+    const body = String(expr || "").trim();
+    if (!body) return m;
+    return `${lead}${stash("display", `\\[${body}\\]`)}`;
+  });
+
+  out = out.replace(/\\\(([\s\S]*?)\\\)/g, (m, expr) => {
+    const body = String(expr || "").trim();
+    if (!body) return m;
+    return stash("inline", `\\(${body}\\)`);
+  });
+
+  return { text: out, placeholders };
+}
+
+function restoreMathSegments(html, placeholders) {
+  let out = String(html || "");
+  placeholders.forEach(({ token, mode, raw }) => {
+    const wrapper = mode === "display"
+      ? `<div class="math-display">${escapeHtml(raw)}</div>`
+      : `<span class="math-inline">${escapeHtml(raw)}</span>`;
+    out = out.replaceAll(token, wrapper);
+  });
+  return out;
+}
+
+function renderRichText(text) {
+  const normalized = normalizeInlineDollarMath(normalizeMathText(text));
+  const { text: withPlaceholders, placeholders } = stashMathSegments(normalized);
+  const html = renderMarkdown(withPlaceholders);
+  return restoreMathSegments(html, placeholders);
+}
+
 function renderMath(el) {
   if (typeof renderMathInElement !== "undefined") {
     renderMathInElement(el, {
@@ -31,6 +279,71 @@ function renderMath(el) {
       throwOnError: false,
     });
   }
+}
+
+async function copyTextToClipboard(text, successMessage = "Copied") {
+  const value = String(text || "");
+  if (!value) {
+    toast("Nothing to copy", "info", 1200);
+    return;
+  }
+
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = value;
+      ta.setAttribute("readonly", "true");
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      ta.style.pointerEvents = "none";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+    }
+    toast(successMessage, "success", 1100);
+  } catch (_) {
+    toast("Copy failed", "error", 1500);
+  }
+}
+
+function attachPromptCopyButton(contentEl, promptText) {
+  if (!contentEl || contentEl.querySelector(".prompt-copy-btn")) return;
+
+  const btn = document.createElement("button");
+  btn.className = "message-copy-btn prompt-copy-btn";
+  btn.type = "button";
+  btn.textContent = "Copy";
+  btn.title = "Copy prompt";
+  btn.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    await copyTextToClipboard(promptText, "Prompt copied");
+  });
+  contentEl.appendChild(btn);
+}
+
+function injectCodeCopyButtons(container) {
+  if (!container) return;
+
+  container.querySelectorAll("pre").forEach((pre) => {
+    if (pre.querySelector(".code-copy-btn")) return;
+
+    const btn = document.createElement("button");
+    btn.className = "code-copy-btn";
+    btn.type = "button";
+    btn.textContent = "Copy";
+    btn.title = "Copy code";
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const code = pre.querySelector("code");
+      const codeText = code ? code.textContent : pre.textContent;
+      await copyTextToClipboard(codeText || "", "Code copied");
+    });
+
+    pre.appendChild(btn);
+  });
 }
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
@@ -50,9 +363,25 @@ const imagePreviewCardEl = () => document.getElementById("image-preview-card");
 // ── Per-conversation message history ──────────────────────────────────────────
 let messages = [];
 let isStreaming = false;
+let isPreparingSend = false;
 let currentStreamController = null;
 let currentRequestId = null;
 let pendingImageDataUrl = null;
+let autoScrollDuringStream = true;
+let currentStopReason = null;
+const deletedConversationIds = new Set();
+
+const DEFAULT_GEN_SETTINGS = {
+  system_prompt: "",
+  enforce_thinking_tags: false,
+  temperature: 0.7,
+  top_p: 0.9,
+  max_tokens: 2048,
+  repetition_penalty: 1.1,
+  repetition_context_size: 20,
+  use_turboquant: false,
+  kv_bits: 4,
+};
 
 const SEND_ICON = `
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -71,9 +400,9 @@ function updateSendBtn() {
   const btn = sendBtnEl();
   if (!btn) return;
 
-  btn.disabled = false;
+  btn.disabled = isPreparingSend && !isStreaming;
   btn.innerHTML = isStreaming ? STOP_ICON : SEND_ICON;
-  btn.title = isStreaming ? "Stop generation" : "Send";
+  btn.title = isStreaming ? "Stop generation" : (isPreparingSend ? "Sending..." : "Send");
 
   updateModelActionButtons();
 }
@@ -82,10 +411,10 @@ function updateModelActionButtons() {
   const loadBtn = loadModelBtn();
   const unloadBtn = unloadModelBtn();
   if (loadBtn) {
-    loadBtn.disabled = isStreaming || !modelSelect().value;
+    loadBtn.disabled = isStreaming || isPreparingSend || !modelSelect().value;
   }
   if (unloadBtn) {
-    unloadBtn.disabled = isStreaming || !state.modelLoaded;
+    unloadBtn.disabled = isStreaming || isPreparingSend || !state.modelLoaded;
   }
 }
 
@@ -161,8 +490,10 @@ async function compressImageToDataUrl(file) {
   });
 }
 
-async function stopCurrentGeneration() {
+async function stopCurrentGeneration(reason = "manual") {
   if (!isStreaming) return;
+
+  currentStopReason = reason;
 
   try {
     if (currentRequestId) {
@@ -176,6 +507,24 @@ async function stopCurrentGeneration() {
   }
 
   currentStreamController?.abort();
+}
+
+function isNearBottom(threshold = 64) {
+  const el = messagesEl();
+  if (!el) return true;
+  const distance = el.scrollHeight - el.scrollTop - el.clientHeight;
+  return distance <= threshold;
+}
+
+function scrollToBottom() {
+  const el = messagesEl();
+  el.scrollTop = el.scrollHeight;
+}
+
+function maybeScrollToBottom(force = false) {
+  if (force || autoScrollDuringStream || isNearBottom()) {
+    scrollToBottom();
+  }
 }
 
 // ── Model selector ────────────────────────────────────────────────────────────
@@ -204,6 +553,7 @@ async function refreshModelSelector(preselect) {
 async function syncLoadedState() {
   try {
     const status = await api("/api/model/loaded");
+    state.loadedModelId = status.model_id || null;
     if (status.model_id && status.state === "ready") {
       state.currentModelId = status.model_id;
       state.modelLoaded = true;
@@ -211,7 +561,11 @@ async function syncLoadedState() {
       updateModelStatus("ready", "Model ready");
       await refreshVisionAvailability(status.model_id);
       updateModelActionButtons();
+      return;
     }
+
+    state.modelLoaded = false;
+    updateModelStatus("", "Model not loaded");
   } catch (_) {}
 }
 
@@ -219,6 +573,451 @@ function updateModelStatus(stateStr, message) {
   const el = modelStatus();
   el.textContent = message || "";
   el.className = "model-status " + (stateStr || "");
+}
+
+function findNextTag(lowerText, fromIndex, candidates) {
+  let bestIndex = -1;
+  let bestTag = null;
+  for (const tag of candidates) {
+    const idx = lowerText.indexOf(tag, fromIndex);
+    if (idx !== -1 && (bestIndex === -1 || idx < bestIndex)) {
+      bestIndex = idx;
+      bestTag = tag;
+    }
+  }
+  return { index: bestIndex, tag: bestTag };
+}
+
+function stripControlTokens(text) {
+  return String(text || "")
+    .replace(/<\|[^|>]+\|>/g, "")
+    .replace(/<\/?think(?:ing)?>/gi, "")
+    .trim();
+}
+
+function unwrapJsonCodeFence(text) {
+  const source = String(text || "").trim();
+  const m = source.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+  return m ? m[1].trim() : source;
+}
+
+function splitByStructuredReasoningObjects(rawText) {
+  const source = String(rawText || "");
+  const trimmed = source.trim();
+  if (!trimmed) return null;
+
+  // Fast bail-outs for streaming hot path.
+  const startsLikeJson = trimmed[0] === "{" || trimmed[0] === "[" || trimmed.startsWith("```");
+  if (!startsLikeJson) return null;
+
+  const lower = trimmed.toLowerCase();
+  const hasReasoningKeyHint =
+    lower.includes('"reasoning"') ||
+    lower.includes('"reasoning_content"') ||
+    lower.includes('"type":"reasoning"') ||
+    lower.includes('"type": "reasoning"') ||
+    lower.includes('"output"');
+  if (!hasReasoningKeyHint) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(unwrapJsonCodeFence(trimmed));
+  } catch (_) {
+    return null;
+  }
+
+  const out = {
+    reasoningText: "",
+    finalText: "",
+    sawReasoningTag: false,
+    inThinking: false,
+    usedStructuredChannels: true,
+  };
+
+  // LM Studio REST shape: { output: [{ type: "reasoning"|"message", content: "..." }, ...] }
+  if (parsed && Array.isArray(parsed.output)) {
+    for (const item of parsed.output) {
+      const t = String(item?.type || "").toLowerCase();
+      const c = stripControlTokens(String(item?.content || ""));
+      if (!c) continue;
+      if (t === "reasoning") {
+        out.reasoningText += (out.reasoningText ? "\n\n" : "") + c;
+      } else if (t === "message") {
+        out.finalText += (out.finalText ? "\n\n" : "") + c;
+      }
+    }
+
+    if (out.reasoningText || out.finalText) {
+      out.sawReasoningTag = Boolean(out.reasoningText);
+      return out;
+    }
+  }
+
+  // OpenAI-compatible shapes seen in LM Studio changelog/docs.
+  const firstChoice = Array.isArray(parsed?.choices) ? parsed.choices[0] : null;
+  const message = firstChoice?.message || null;
+  const delta = firstChoice?.delta || null;
+
+  const reasoning =
+    message?.reasoning ??
+    message?.reasoning_content ??
+    delta?.reasoning ??
+    delta?.reasoning_content ??
+    parsed?.reasoning ??
+    parsed?.reasoning_content;
+  const finalMessage =
+    message?.content ??
+    delta?.content ??
+    parsed?.message ??
+    parsed?.content;
+
+  if (reasoning != null || finalMessage != null) {
+    out.reasoningText = stripControlTokens(String(reasoning || ""));
+    out.finalText = stripControlTokens(String(finalMessage || ""));
+    out.sawReasoningTag = Boolean(out.reasoningText);
+    return out;
+  }
+
+  return null;
+}
+
+function splitByStructuredChannelTags(rawText) {
+  const source = String(rawText || "");
+  const markerRegex = /<\|channel\|>\s*(analysis|final)\s*<\|message\|>/ig;
+  const markers = [];
+  let m;
+
+  while ((m = markerRegex.exec(source)) !== null) {
+    markers.push({
+      channel: m[1].toLowerCase(),
+      contentStart: markerRegex.lastIndex,
+      markerStart: m.index,
+    });
+  }
+
+  if (!markers.length) return null;
+
+  let reasoningText = "";
+  let finalText = "";
+
+  for (let i = 0; i < markers.length; i += 1) {
+    const curr = markers[i];
+    const next = markers[i + 1];
+    const rawSegment = source.slice(curr.contentStart, next ? next.markerStart : source.length);
+    const cleaned = stripControlTokens(rawSegment.replace(/<\|end\|>/g, "\n"));
+    if (!cleaned) continue;
+
+    if (curr.channel === "analysis") {
+      reasoningText += (reasoningText ? "\n\n" : "") + cleaned;
+    } else if (curr.channel === "final") {
+      finalText += (finalText ? "\n\n" : "") + cleaned;
+    }
+  }
+
+  return {
+    reasoningText,
+    finalText,
+    sawReasoningTag: Boolean(reasoningText),
+    inThinking: false,
+    usedStructuredChannels: true,
+  };
+}
+
+function isLikelyStructuredControlStream(text) {
+  const source = String(text || "");
+  if (!source) return false;
+  const lower = source.toLowerCase();
+
+  // Known gpt-oss style control tokens and partial starts during streaming.
+  if (lower.includes("<|channel|>") || lower.includes("<|message|>")) return true;
+  if (lower.includes("<|start|>assistant") || lower.includes("<|start|>")) return true;
+
+  const trimmed = source.trimStart();
+  if (trimmed.startsWith("<|")) return true;
+
+  // Detect likely partial token prefixes while chunks are still arriving.
+  return /<\|[^\n]{0,48}$/.test(source);
+}
+
+const HIGH_CONF_REASONING_START_PATTERNS = [
+  /^\s*(?:#+\s*)?(?:here(?:'|’)s|this is|below is)\s+(?:my\s+)?(?:full\s+|detailed\s+|brief\s+)?(?:thinking|reasoning)\s+process\s*:?/i,
+  /^\s*(?:#+\s*)?(?:thinking|reasoning)\s*process\s*:?/i,
+  /^\s*(?:#+\s*)?chain\s+of\s+thought\s*:?/i,
+  /^\s*(?:internal\s+)?(?:thoughts?|thinking|reasoning)\s*:?/i,
+];
+
+const HIGH_CONF_REASONING_LEAD_PATTERNS = [
+  /\b(?:thinking|reasoning)\s*process\s*:/i,
+  /\bchain\s+of\s+thought\s*:/i,
+  /\b(?:analyze|analyse)\s+the\s+request\b/i,
+  /\bidentify\s+key\s+concepts\b/i,
+  /\bdeconstruct\s+the\s+request\b/i,
+];
+
+const STARTS_LIKE_REASONING_PATTERNS = [
+  /^(here(?:'|’)s|this is|below is).{0,120}(thinking process|reasoning process|chain of thought|reasoning steps)/i,
+  /^(let me think|let(?:'|’)s think|reasoning:|thinking:)/i,
+  /^(#+\s*)?(thinking process|reasoning process|chain of thought)/i,
+];
+
+const PLANNING_SIGNAL_PATTERNS = [
+  /analyze\s+the\s+request/i,
+  /identify\s+key\s+concepts/i,
+  /deconstruct the request/i,
+  /structure the explanation/i,
+  /drafting the content/i,
+  /key components/i,
+  /workflow/i,
+  /pros & cons/i,
+  /how .* works/i,
+  /initial definition/i,
+  /step\s*1\s*:/i,
+];
+
+const META_REASONING_START_PATTERNS = [
+  /^\s*the\s+user\s+is\s+asking\s+about\b/i,
+  /^\s*i(?:'|’)ll\s+(?:provide|give|explain)\b/i,
+  /^\s*let\s+me\s+(?:provide|structure|break\s+this\s+down|walk\s+through)\b/i,
+  /^\s*here(?:'|’)s\s+(?:how\s+i(?:'|’)ll|the\s+plan)\b/i,
+];
+
+const META_REASONING_TRANSITION_REGEX = /(?:^|\n)\s*(?:singular\s+value\s+decomposition\s*\(svd\)\s+is\b|in\s+summary\b|to\s+summarize\b|the\s+key\s+idea\s+is\b|now\s+let(?:'|’)s\s+(?:answer|explain)\b)/i;
+
+const REASONING_TRANSITION_REGEX = /(?:^|\n)\s*(?:\*{0,2}\(?\s*end\s+of\s+(?:thought\s+process|thinking|reasoning)\s*\)?\*{0,2}|<\/think(?:ing)?>|ok[,!\s]+ready\s+to\s+generate\b|ready\s+to\s+generate\b|final answer\s*:|answer\s*:|now\s*(?:here(?:'|’)s|is)\s*(?:the\s*)?(?:answer|explanation)\s*:|here(?:'|’)s\s+(?:the\s*)?(?:actual\s*)?(?:answer|response)\s*:|in short\s*:|in summary\s*:)/i;
+
+const REASONING_PREFIX_STRIP_REGEX = /^\s*(?:\*{0,2}\(?\s*end\s+of\s+(?:thought\s+process|thinking|reasoning)\s*\)?\*{0,2}|<\/think(?:ing)?>)+\s*/i;
+
+function splitByReasoningHeuristics(text) {
+  const source = String(text || "");
+  const normalized = source.trimStart();
+  if (!normalized) {
+    return { reasoningText: "", finalText: "", usedHeuristic: false };
+  }
+
+  const preview = normalized.slice(0, 700).toLowerCase();
+  const lead = normalized.slice(0, 260);
+  const leadLower = lead.toLowerCase();
+
+  // Cheap lexical gate first, then regex checks only when likely relevant.
+  const hasReasoningLexeme =
+    leadLower.includes("thinking") ||
+    leadLower.includes("reasoning") ||
+    leadLower.includes("chain of thought") ||
+    leadLower.includes("analyze the request") ||
+    leadLower.includes("analyse the request") ||
+    leadLower.includes("identify key concepts") ||
+    leadLower.includes("deconstruct the request");
+
+  const hasHighConfidenceReasoningStart =
+    hasReasoningLexeme && (
+      HIGH_CONF_REASONING_START_PATTERNS.some((p) => p.test(normalized))
+      || HIGH_CONF_REASONING_LEAD_PATTERNS.some((p) => p.test(lead))
+    );
+
+  // Common model phrasing when it dumps internal planning without explicit tags.
+  const startsLikeReasoning = hasReasoningLexeme
+    && STARTS_LIKE_REASONING_PATTERNS.some((p) => p.test(normalized));
+
+  const planningSignals = PLANNING_SIGNAL_PATTERNS.reduce(
+    (count, pattern) => count + (pattern.test(preview) ? 1 : 0),
+    0,
+  );
+
+  const hasMetaReasoningStart = META_REASONING_START_PATTERNS.some((p) => p.test(normalized));
+  const leadLines = normalized
+    .split(/\r?\n/)
+    .slice(0, 16)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const hasEarlyOutline = leadLines.filter((line) => /^\d+[.)]\s+/.test(line)).length >= 2;
+  const metaPlanningLikely = hasMetaReasoningStart && (hasEarlyOutline || planningSignals >= 1);
+
+  if (!startsLikeReasoning && !hasHighConfidenceReasoningStart && planningSignals < 2 && !metaPlanningLikely) {
+    return { reasoningText: "", finalText: source, usedHeuristic: false };
+  }
+
+  // Split where models typically transition from planning to user-facing answer.
+  // Includes explicit end-markers emitted by many reasoning-style prompts.
+  const transition = REASONING_TRANSITION_REGEX.exec(source) || META_REASONING_TRANSITION_REGEX.exec(source);
+
+  if (!transition || transition.index < 20) {
+    // Strong/meta starts should still be treated as reasoning even without
+    // explicit boundary tags.
+    if (hasHighConfidenceReasoningStart || metaPlanningLikely) {
+      return {
+        reasoningText: stripControlTokens(source),
+        finalText: "",
+        usedHeuristic: true,
+      };
+    }
+
+    // Also treat likely planning dumps as reasoning-only when they begin with
+    // a thinking-style lead and include enough planning cues.
+    if (startsLikeReasoning && (planningSignals >= 1 || hasEarlyOutline)) {
+      return {
+        reasoningText: stripControlTokens(source),
+        finalText: "",
+        usedHeuristic: true,
+      };
+    }
+
+    // Otherwise stay strict to avoid false positives.
+    return { reasoningText: "", finalText: source, usedHeuristic: false };
+  }
+
+  const reasoningText = stripControlTokens(source.slice(0, transition.index));
+  const finalText = source
+    .slice(transition.index)
+    .replace(REASONING_PREFIX_STRIP_REGEX, "")
+    .trim();
+  const cleanedFinal = stripControlTokens(finalText);
+
+  if (!reasoningText || !cleanedFinal) {
+    return { reasoningText: "", finalText: source, usedHeuristic: false };
+  }
+
+  return { reasoningText, finalText: cleanedFinal, usedHeuristic: true };
+}
+
+function splitReasoningAndFinal(rawText, options = {}) {
+  const text = String(rawText || "");
+  const streaming = Boolean(options.streaming);
+
+  const structuredObject = splitByStructuredReasoningObjects(text);
+  if (structuredObject) {
+    return structuredObject;
+  }
+
+  const structured = splitByStructuredChannelTags(text);
+  if (structured) {
+    return structured;
+  }
+
+  if (streaming && isLikelyStructuredControlStream(text)) {
+    return {
+      reasoningText: "",
+      finalText: "",
+      sawReasoningTag: false,
+      inThinking: true,
+      pendingStructuredControl: true,
+    };
+  }
+
+  const lower = text.toLowerCase();
+  const openTags = ["<thinking>", "<think>"];
+  const closeTags = ["</thinking>", "</think>"];
+
+  let i = 0;
+  let inThinking = false;
+  let sawReasoningTag = false;
+  let reasoningText = "";
+  let finalText = "";
+
+  while (i < text.length) {
+    if (!inThinking) {
+      const nextOpen = findNextTag(lower, i, openTags);
+      if (nextOpen.index === -1) {
+        finalText += text.slice(i);
+        break;
+      }
+
+      finalText += text.slice(i, nextOpen.index);
+      i = nextOpen.index + nextOpen.tag.length;
+      inThinking = true;
+      sawReasoningTag = true;
+      continue;
+    }
+
+    const nextClose = findNextTag(lower, i, closeTags);
+    if (nextClose.index === -1) {
+      reasoningText += text.slice(i);
+      i = text.length;
+      break;
+    }
+
+    reasoningText += text.slice(i, nextClose.index);
+    i = nextClose.index + nextClose.tag.length;
+    inThinking = false;
+  }
+
+  reasoningText = stripControlTokens(reasoningText);
+  finalText = stripControlTokens(finalText);
+
+  if (!sawReasoningTag && !inThinking && !reasoningText.trim()) {
+    const heuristic = splitByReasoningHeuristics(text);
+    if (heuristic.usedHeuristic) {
+      return {
+        reasoningText: heuristic.reasoningText,
+        finalText: heuristic.finalText,
+        sawReasoningTag: false,
+        inThinking: false,
+      };
+    }
+  }
+
+  return {
+    reasoningText,
+    finalText,
+    sawReasoningTag,
+    inThinking,
+  };
+}
+
+function createAssistantRenderNodes(contentEl) {
+  const reasoningBlock = document.createElement("details");
+  reasoningBlock.className = "reasoning-block hidden";
+
+  const reasoningSummary = document.createElement("summary");
+  reasoningSummary.textContent = "Reasoning";
+
+  const reasoningContent = document.createElement("div");
+  reasoningContent.className = "reasoning-content";
+
+  reasoningBlock.appendChild(reasoningSummary);
+  reasoningBlock.appendChild(reasoningContent);
+
+  const finalContent = document.createElement("div");
+  finalContent.className = "final-content";
+
+  contentEl.appendChild(reasoningBlock);
+  contentEl.appendChild(finalContent);
+
+  return {
+    root: contentEl,
+    reasoningBlock,
+    reasoningSummary,
+    reasoningContent,
+    finalContent,
+  };
+}
+
+function renderAssistantFromRaw(nodes, rawText, streaming = false) {
+  const parsed = splitReasoningAndFinal(rawText, { streaming });
+  const hasReasoning =
+    parsed.sawReasoningTag ||
+    parsed.inThinking ||
+    Boolean(parsed.reasoningText.trim());
+
+  if (hasReasoning) {
+    nodes.reasoningBlock.classList.remove("hidden");
+    nodes.reasoningSummary.textContent = parsed.inThinking && streaming
+      ? (parsed.pendingStructuredControl ? "Reasoning (parsing...)" : "Reasoning (streaming...)")
+      : "Reasoning";
+    nodes.reasoningContent.innerHTML = renderRichText(parsed.reasoningText || "");
+
+    // Keep it open while reasoning is still streaming so users can inspect it live.
+    if (parsed.inThinking && streaming) {
+      nodes.reasoningBlock.open = true;
+    }
+  } else {
+    nodes.reasoningBlock.classList.add("hidden");
+    nodes.reasoningContent.innerHTML = "";
+    nodes.reasoningSummary.textContent = "Reasoning";
+  }
+
+  nodes.finalContent.innerHTML = renderRichText(parsed.finalText || "");
+  injectCodeCopyButtons(nodes.root);
+  renderMath(nodes.root);
 }
 
 // ── Message rendering ─────────────────────────────────────────────────────────
@@ -235,8 +1034,12 @@ function addMessage(role, content, streaming = false, imageDataUrl = null) {
   const contentEl = document.createElement("div");
   contentEl.className = "message-content";
 
+  let assistantNodes = null;
+
   if (streaming) {
     contentEl.classList.add("streaming-cursor");
+    assistantNodes = createAssistantRenderNodes(contentEl);
+    renderAssistantFromRaw(assistantNodes, "", true);
   } else {
     if (imageDataUrl) {
       const img = document.createElement("img");
@@ -246,20 +1049,21 @@ function addMessage(role, content, streaming = false, imageDataUrl = null) {
       contentEl.appendChild(img);
     }
 
-    contentEl.innerHTML += renderMarkdown(content || "");
-    renderMath(contentEl);
+    if (role === "assistant") {
+      assistantNodes = createAssistantRenderNodes(contentEl);
+      renderAssistantFromRaw(assistantNodes, content || "", false);
+    } else {
+      contentEl.innerHTML += renderRichText(content || "");
+      attachPromptCopyButton(contentEl, content || "");
+      renderMath(contentEl);
+    }
   }
 
   el.appendChild(avatar);
   el.appendChild(contentEl);
   messagesEl().appendChild(el);
-  scrollToBottom();
-  return { contentEl, messageEl: el };
-}
-
-function scrollToBottom() {
-  const el = messagesEl();
-  el.scrollTop = el.scrollHeight;
+  maybeScrollToBottom(true);
+  return { contentEl, messageEl: el, assistantNodes };
 }
 
 // ── Stats bar (appended inside contentEl, below the generated text) ───────────
@@ -292,15 +1096,46 @@ async function sendMessage() {
   const input = inputEl();
   const text = input.value.trim();
   if (isStreaming) {
-    await stopCurrentGeneration();
+    await stopCurrentGeneration("manual");
     return;
   }
+  if (isPreparingSend) return;
 
   if (!text && !pendingImageDataUrl) return;
 
-  if (!state.modelLoaded) {
-    toast("Load a model first — select one and click Load.", "error", 4000);
+  const selectedModelId = state.currentModelId || modelSelect().value || null;
+  if (!selectedModelId) {
+    toast("Select a model first.", "error", 3000);
     return;
+  }
+
+  isPreparingSend = true;
+  updateSendBtn();
+
+  const requiresLoad = !state.modelLoaded || state.loadedModelId !== selectedModelId;
+  if (requiresLoad) {
+    updateModelStatus("loading", "Loading model…");
+    try {
+      await api("/api/model/load", {
+        method: "POST",
+        body: JSON.stringify({ model_id: selectedModelId }),
+      });
+      state.currentModelId = selectedModelId;
+      state.loadedModelId = selectedModelId;
+      state.modelLoaded = true;
+      await syncSettingsForModel(selectedModelId);
+      await refreshVisionAvailability(selectedModelId);
+      updateModelStatus("ready", "Model ready");
+      updateModelActionButtons();
+      updateSendBtn();
+    } catch (e) {
+      state.modelLoaded = false;
+      state.loadedModelId = null;
+      state.modelVisionCapable = false;
+      updateModelStatus("error", "Failed to load");
+      toast(e.message || "Failed to load selected model", "error");
+      return;
+    }
   }
 
   if (pendingImageDataUrl && !state.modelVisionCapable) {
@@ -314,19 +1149,46 @@ async function sendMessage() {
   const userMsg = { role: "user", content: text };
   if (pendingImageDataUrl) userMsg.image_data_url = pendingImageDataUrl;
 
+  const nextMessages = [...messages, userMsg];
+  if (!state.currentConvId) {
+    try {
+      const draft = await api("/api/conversations/draft", {
+        method: "POST",
+        body: JSON.stringify({
+          conversation_id: null,
+          model_id: state.currentModelId,
+          messages: nextMessages,
+        }),
+      });
+      state.currentConvId = draft.conversation_id;
+      await loadConversationList();
+    } catch (_) {
+      // Non-fatal: streaming can still proceed and final save will persist it.
+    }
+  }
+
   addMessage("user", text, false, pendingImageDataUrl);
-  messages.push(userMsg);
+  messages = nextMessages;
   clearPendingImage();
 
   isStreaming = true;
+  autoScrollDuringStream = true;
   updateSendBtn();
 
-  const { contentEl: assistantContentEl } = addMessage("assistant", "", true);
+  const {
+    contentEl: assistantContentEl,
+    messageEl: assistantMessageEl,
+    assistantNodes,
+  } = addMessage("assistant", "", true);
   let assistantText = "";
   let pendingStats = null;
   const t0 = performance.now();
   currentRequestId = crypto.randomUUID();
   currentStreamController = new AbortController();
+  currentStopReason = null;
+  const streamConversationId = state.currentConvId;
+  const streamModelId = state.currentModelId;
+  const streamBaseMessages = [...messages];
 
   try {
     const settings = collectSettings();
@@ -367,16 +1229,19 @@ async function sendMessage() {
           const event = JSON.parse(dataStr);
           if (event.type === "chunk") {
             assistantText += event.text;
-            assistantContentEl.innerHTML = renderMarkdown(assistantText);
-            renderMath(assistantContentEl);
-            scrollToBottom();
+            if (assistantNodes) {
+              renderAssistantFromRaw(assistantNodes, assistantText, true);
+            }
+            maybeScrollToBottom();
           } else if (event.type === "stats") {
             pendingStats = event;
           } else if (event.type === "done") {
             state.currentConvId = event.conversation_id;
             await loadConversationList();
           } else if (event.type === "stopped") {
-            toast("Generation stopped", "info", 1200);
+            if (currentStopReason === "manual") {
+              toast("Generation stopped", "info", 1200);
+            }
           } else if (event.type === "error") {
             toast(event.message, "error");
           }
@@ -386,9 +1251,10 @@ async function sendMessage() {
 
     // Final clean render
     assistantContentEl.classList.remove("streaming-cursor");
-    assistantContentEl.innerHTML = renderMarkdown(assistantText);
-    renderMath(assistantContentEl);
-    scrollToBottom();
+    if (assistantNodes) {
+      renderAssistantFromRaw(assistantNodes, assistantText, false);
+    }
+    maybeScrollToBottom();
 
     const elapsed = (performance.now() - t0) / 1000;
     renderStats(assistantContentEl, pendingStats, elapsed);
@@ -396,15 +1262,55 @@ async function sendMessage() {
     if (assistantText.trim()) {
       messages.push({ role: "assistant", content: assistantText });
     } else {
-      assistantContentEl.remove();
+      assistantMessageEl.remove();
     }
 
   } catch (err) {
     if (err.name === "AbortError") {
       assistantContentEl.classList.remove("streaming-cursor");
-      if (!assistantText.trim()) {
-        assistantContentEl.remove();
+      const conversationDeleted = Boolean(
+        streamConversationId && deletedConversationIds.has(streamConversationId),
+      );
+
+      if (conversationDeleted || currentStopReason === "delete-conversation") {
+        assistantMessageEl.remove();
+        return;
       }
+
+      const partialText = assistantText.trim();
+      if (!partialText) {
+        assistantMessageEl.remove();
+        return;
+      }
+
+      if (assistantNodes) {
+        renderAssistantFromRaw(assistantNodes, assistantText, false);
+      }
+      const elapsed = (performance.now() - t0) / 1000;
+      renderStats(assistantContentEl, pendingStats, elapsed);
+
+      // Preserve the partial response in-memory when still on this conversation.
+      const partialAssistant = { role: "assistant", content: assistantText };
+      if (state.currentConvId === streamConversationId) {
+        messages.push(partialAssistant);
+      }
+
+      // Persist partial text so switching chats does not lose streamed reasoning/content.
+      try {
+        const draft = await api("/api/conversations/draft", {
+          method: "POST",
+          body: JSON.stringify({
+            conversation_id: streamConversationId,
+            model_id: streamModelId,
+            messages: [...streamBaseMessages, partialAssistant],
+          }),
+        });
+        if (state.currentConvId === streamConversationId && draft?.conversation_id) {
+          state.currentConvId = draft.conversation_id;
+        }
+        await loadConversationList();
+      } catch (_) {}
+
       return;
     }
 
@@ -413,9 +1319,11 @@ async function sendMessage() {
       `<span style="color:var(--danger)">Error: ${err.message}</span>`;
     toast(err.message, "error");
   } finally {
+    isPreparingSend = false;
     isStreaming = false;
     currentRequestId = null;
     currentStreamController = null;
+    currentStopReason = null;
     updateSendBtn();
   }
 }
@@ -441,8 +1349,17 @@ export async function loadConversationList() {
       del.title = "Delete";
       del.addEventListener("click", async e => {
         e.stopPropagation();
+        const deletingActiveConversation = state.currentConvId === conv.id;
+        deletedConversationIds.add(conv.id);
+
+        if (deletingActiveConversation && isStreaming) {
+          await stopCurrentGeneration("delete-conversation");
+        }
+
         await api(`/api/conversations/${conv.id}`, { method: "DELETE" });
-        if (state.currentConvId === conv.id) startNewConversation();
+        if (deletingActiveConversation) {
+          startNewConversation({ skipStop: true });
+        }
         await loadConversationList();
       });
 
@@ -456,6 +1373,10 @@ export async function loadConversationList() {
 
 async function loadConversation(convId) {
   try {
+    if (isStreaming) {
+      await stopCurrentGeneration("switch-conversation");
+    }
+
     const conv = await api(`/api/conversations/${convId}`);
     state.currentConvId = convId;
     messages = conv.messages || [];
@@ -474,6 +1395,8 @@ async function loadConversation(convId) {
     if (conv.model) {
       const select = modelSelect();
       if ([...select.options].some(o => o.value === conv.model)) select.value = conv.model;
+      state.currentModelId = conv.model;
+      await syncSettingsForModel(conv.model);
       await refreshVisionAvailability(conv.model);
     }
   } catch (e) {
@@ -481,8 +1404,9 @@ async function loadConversation(convId) {
   }
 }
 
-export function startNewConversation() {
-  if (isStreaming) stopCurrentGeneration();
+export function startNewConversation(options = {}) {
+  const skipStop = Boolean(options.skipStop);
+  if (isStreaming && !skipStop) stopCurrentGeneration("new-conversation");
   state.currentConvId = null;
   messages = [];
   clearPendingImage();
@@ -503,32 +1427,59 @@ export function startNewConversation() {
 
 // ── Settings panel ────────────────────────────────────────────────────────────
 function collectSettings() {
+  const toNum = (v, fallback) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  };
+
+  const toInt = (v, fallback) => {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : fallback;
+  };
+
   return {
     system_prompt:          document.getElementById("set-system-prompt").value,
-    temperature:            parseFloat(document.getElementById("set-temperature").value),
-    top_p:                  parseFloat(document.getElementById("set-top-p").value),
-    max_tokens:             parseInt(document.getElementById("set-max-tokens").value),
-    repetition_penalty:     parseFloat(document.getElementById("set-rep-penalty").value),
-    repetition_context_size:parseInt(document.getElementById("set-rep-context").value),
+    enforce_thinking_tags:  document.getElementById("set-enforce-thinking-tags").checked,
+    temperature:            toNum(document.getElementById("set-temperature").value, DEFAULT_GEN_SETTINGS.temperature),
+    top_p:                  toNum(document.getElementById("set-top-p").value, DEFAULT_GEN_SETTINGS.top_p),
+    max_tokens:             toInt(document.getElementById("set-max-tokens").value, DEFAULT_GEN_SETTINGS.max_tokens),
+    repetition_penalty:     toNum(document.getElementById("set-rep-penalty").value, DEFAULT_GEN_SETTINGS.repetition_penalty),
+    repetition_context_size:toInt(document.getElementById("set-rep-context").value, DEFAULT_GEN_SETTINGS.repetition_context_size),
     use_turboquant:         document.getElementById("set-turboquant").checked,
-    kv_bits:                parseFloat(document.getElementById("set-kv-bits").value),
+    kv_bits:                toNum(document.getElementById("set-kv-bits").value, DEFAULT_GEN_SETTINGS.kv_bits),
   };
 }
 
 function applySettings(s) {
-  document.getElementById("set-system-prompt").value   = s.system_prompt || "";
-  document.getElementById("set-temperature").value     = s.temperature;
-  document.getElementById("set-top-p").value           = s.top_p;
-  document.getElementById("set-max-tokens").value      = s.max_tokens;
-  document.getElementById("set-rep-penalty").value     = s.repetition_penalty;
-  document.getElementById("set-rep-context").value     = s.repetition_context_size;
-  document.getElementById("set-turboquant").checked    = s.use_turboquant;
-  document.getElementById("set-kv-bits").value         = s.kv_bits || 4;
-  document.getElementById("val-temperature").textContent = s.temperature;
-  document.getElementById("val-top-p").textContent       = s.top_p;
-  document.getElementById("val-rep-penalty").textContent = s.repetition_penalty;
-  document.getElementById("val-kv-bits").textContent     = s.kv_bits || 4;
-  document.getElementById("turboquant-options").classList.toggle("hidden", !s.use_turboquant);
+  const merged = { ...DEFAULT_GEN_SETTINGS, ...(s || {}) };
+  document.getElementById("set-system-prompt").value   = merged.system_prompt || "";
+  document.getElementById("set-enforce-thinking-tags").checked = !!merged.enforce_thinking_tags;
+  document.getElementById("set-temperature").value     = merged.temperature;
+  document.getElementById("set-top-p").value           = merged.top_p;
+  document.getElementById("set-max-tokens").value      = merged.max_tokens;
+  document.getElementById("set-rep-penalty").value     = merged.repetition_penalty;
+  document.getElementById("set-rep-context").value     = merged.repetition_context_size;
+  document.getElementById("set-turboquant").checked    = !!merged.use_turboquant;
+  document.getElementById("set-kv-bits").value         = merged.kv_bits || 4;
+  document.getElementById("val-temperature").textContent = merged.temperature;
+  document.getElementById("val-top-p").textContent       = merged.top_p;
+  document.getElementById("val-rep-penalty").textContent = merged.repetition_penalty;
+  document.getElementById("val-kv-bits").textContent     = merged.kv_bits || 4;
+  document.getElementById("turboquant-options").classList.toggle("hidden", !merged.use_turboquant);
+}
+
+async function syncSettingsForModel(modelId = state.currentModelId) {
+  if (!modelId) {
+    applySettings(DEFAULT_GEN_SETTINGS);
+    return;
+  }
+
+  try {
+    const s = await api(`/api/settings/${encodeURIComponent(modelId)}`);
+    applySettings(s);
+  } catch (_) {
+    applySettings(DEFAULT_GEN_SETTINGS);
+  }
 }
 
 async function openSettings() {
@@ -563,12 +1514,15 @@ async function loadModel() {
       body: JSON.stringify({ model_id: modelId }),
     });
     state.currentModelId = modelId;
+    state.loadedModelId = modelId;
     state.modelLoaded = true;
+    await syncSettingsForModel(modelId);
     await refreshVisionAvailability(modelId);
     updateModelStatus("ready", "Model ready");
     toast("Model loaded", "success");
   } catch (e) {
     state.modelLoaded = false;
+    state.loadedModelId = null;
     state.modelVisionCapable = false;
     updateModelStatus("error", "Failed to load");
     toast(e.message, "error");
@@ -596,6 +1550,7 @@ async function unloadModel() {
   try {
     await api("/api/model/unload", { method: "POST" });
     state.modelLoaded = false;
+    state.loadedModelId = null;
     state.modelVisionCapable = false;
     state.currentModelId = null;
     clearPendingImage();
@@ -621,8 +1576,22 @@ function autoResize(el) {
 export async function initChat() {
   // Enable textarea immediately — no waiting for API
   const input = inputEl();
+  const msgPane = messagesEl();
   input.disabled = false;
   input.placeholder = "Load a model to start chatting…";
+
+  msgPane?.addEventListener("scroll", () => {
+    if (!isStreaming) return;
+    autoScrollDuringStream = isNearBottom();
+  });
+
+  msgPane?.addEventListener("click", e => {
+    if (!isStreaming) return;
+    const t = e.target;
+    if (t && t.closest && t.closest(".reasoning-block summary")) {
+      autoScrollDuringStream = false;
+    }
+  });
 
   sendBtnEl().addEventListener("click", sendMessage);
 
@@ -656,7 +1625,18 @@ export async function initChat() {
   input.addEventListener("input", e => autoResize(e.target));
 
   modelSelect().addEventListener("change", () => {
-    state.currentModelId = modelSelect().value || null;
+    const selectedModelId = modelSelect().value || null;
+    state.currentModelId = selectedModelId;
+
+    if (!selectedModelId) {
+      updateModelStatus("", "No model selected");
+    } else if (state.modelLoaded && state.loadedModelId === selectedModelId) {
+      updateModelStatus("ready", "Model ready");
+    } else {
+      updateModelStatus("", "Selected model not loaded");
+    }
+
+    syncSettingsForModel(state.currentModelId);
     refreshVisionAvailability(state.currentModelId);
     updateModelActionButtons();
   });
@@ -722,6 +1702,10 @@ async function _asyncInit() {
 
   // 3. Check if model is still loaded from a previous session
   await syncLoadedState();
+
+  if (state.currentModelId) {
+    await syncSettingsForModel(state.currentModelId);
+  }
 
   // Update placeholder based on whether model is ready
   if (state.modelLoaded) {

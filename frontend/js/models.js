@@ -26,6 +26,17 @@ function fmtSize(gb, estimated) {
   return estimated ? `~${gb} GB` : `${gb} GB`;
 }
 
+function fmtModelDate(value) {
+  if (!value) return "";
+  const dt = new Date(value);
+  if (Number.isNaN(dt.getTime())) return "";
+  return dt.toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+}
+
 function renderTagChips(model) {
   const tags = Array.isArray(model.tags) ? model.tags.slice(0, 4) : [];
   const chips = [];
@@ -321,6 +332,7 @@ function buildSearchCard(m, alreadyLocal) {
   const sizeStr = m.size_gb != null
     ? fmtSize(m.size_gb, false)
     : (m.est_size_gb != null ? fmtSize(m.est_size_gb, true) : "…");
+  const updatedLabel = fmtModelDate(m.last_modified);
 
   card.innerHTML = `
     <div class="model-card-info">
@@ -331,6 +343,7 @@ function buildSearchCard(m, alreadyLocal) {
         ${unsupportedChip(m)}
         ${m.publisher ? `<span class="publisher-badge">${escHtml(m.publisher)}</span>` : ""}
         <span class="model-card-size">${downloads}</span>
+        ${updatedLabel ? `<span class="model-card-size">Updated ${escHtml(updatedLabel)}</span>` : ""}
       </div>
       <div class="model-tag-row">${renderTagChips(m)}</div>
     </div>

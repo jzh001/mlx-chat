@@ -8,6 +8,8 @@ import threading
 import time
 import socket
 
+import uvicorn
+
 
 def _find_free_port() -> int:
     with socket.socket() as s:
@@ -18,11 +20,40 @@ def _find_free_port() -> int:
 PORT = _find_free_port()
 SERVER_URL = f"http://127.0.0.1:{PORT}"
 
+_uvicorn_server = None
+
 
 def _start_server():
-    import uvicorn
+    global _uvicorn_server
     from backend.server import app
-    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="warning")
+
+    config = uvicorn.Config(
+        app,
+        host="127.0.0.1",
+        port=PORT,
+        log_level="warning",
+        loop="asyncio",
+        lifespan="on",
+    )
+    _uvicorn_server = uvicorn.Server(config)
+    _uvicorn_server.run()
+
+
+def _stop_server(timeout: float = 2.0):
+    global _uvicorn_server
+    if _uvicorn_server is None:
+        return
+    _uvicorn_server.should_exit = True
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if getattr(_uvicorn_server, "started", False) is False:
+            break
+        time.sleep(0.05)
+
+    # Don't let slow shutdown hooks hold the UI close path.
+    if getattr(_uvicorn_server, "started", False):
+        _uvicorn_server.force_exit = True
 
 
 def _wait_for_server(timeout: float = 30.0) -> bool:
@@ -37,7 +68,7 @@ def _wait_for_server(timeout: float = 30.0) -> bool:
 
 
 def main():
-    # Start FastAPI in a background daemon thread
+    # Run the server in a daemon thread so UI close is never blocked on teardown.
     server_thread = threading.Thread(target=_start_server, daemon=True)
     server_thread.start()
 
@@ -46,10 +77,11 @@ def main():
         sys.exit(1)
 
     # Open native macOS window with PyWebView (uses WKWebView – minimal memory)
+    # Note: Python 3.14 may still be unstable with current PyWebView/Cocoa stacks.
     try:
         import webview
 
-        window = webview.create_window(
+        webview.create_window(
             title="MLX Chat",
             url=SERVER_URL,
             width=1280,
@@ -69,6 +101,8 @@ def main():
             server_thread.join()
         except KeyboardInterrupt:
             pass
+    finally:
+        _stop_server(timeout=0.15)
 
 
 if __name__ == "__main__":

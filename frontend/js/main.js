@@ -9,6 +9,7 @@ import { initModels } from "./models.js";
 // ── Global state ──────────────────────────────────────────────────────────────
 export const state = {
   currentModelId: null,
+  loadedModelId: null,
   modelLoaded: false,
   modelVisionCapable: false,
   currentConvId: null,
@@ -74,7 +75,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setInterval(async () => {
     try {
       const status = await api("/api/model/loaded");
-      state.currentModelId = status.model_id;
+      state.loadedModelId = status.model_id || null;
       state.modelLoaded = status.state === "ready";
     } catch (_) {}
   }, 5000);
