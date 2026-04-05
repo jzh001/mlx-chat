@@ -1,0 +1,23 @@
+# Build output
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# App data
+~/.mlx_chat/
+
+# macOS
+.DS_Store
+*.app.zip
+
+# IDE
+.idea/
+.vscode/
