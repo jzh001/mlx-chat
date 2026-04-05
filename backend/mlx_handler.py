@@ -3,6 +3,7 @@ Wrapper around mlx_vlm for model loading and streaming generation.
 Keeps one model in memory at a time.
 """
 import threading
+import gc
 from typing import Generator, List, Dict, Any, Optional
 
 _lock = threading.Lock()
@@ -59,6 +60,16 @@ def unload_model() -> None:
         _processor = None
         _config = None
         _current_model_id = None
+
+        # Force Python/MLX cleanup so resident memory drops sooner.
+        gc.collect()
+        try:
+            import mlx.core as mx
+            mx.clear_cache()
+        except Exception:
+            # Cleanup is best-effort; unload should still succeed.
+            pass
+
         _load_status = {"state": "idle", "message": ""}
 
 

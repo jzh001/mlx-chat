@@ -285,7 +285,10 @@ def list_local_models() -> List[Dict[str, Any]]:
         if not repo.repo_id.startswith(f"{MLX_ORG}/"):
             continue
         size_gb = repo.size_on_disk / _GiB
-        vision = _has_vision([], repo.repo_id)
+        # Local cards should use the same capability detection as browse cards.
+        # Fall back to name-based heuristic if metadata is unavailable.
+        caps = get_model_capabilities(repo.repo_id)
+        vision = bool(caps.get("vision", False)) or _has_vision([], repo.repo_id)
         results.append({
             "id":        repo.repo_id,
             "name":      repo.repo_id.split("/", 1)[-1],

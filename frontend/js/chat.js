@@ -39,6 +39,7 @@ const inputEl      = () => document.getElementById("user-input");
 const sendBtnEl    = () => document.getElementById("btn-send");
 const modelSelect  = () => document.getElementById("model-select");
 const loadModelBtn = () => document.getElementById("btn-load-model");
+const unloadModelBtn = () => document.getElementById("btn-unload-model");
 const modelStatus  = () => document.getElementById("model-status");
 const welcomeEl    = () => document.getElementById("welcome");
 const attachImageBtn = () => document.getElementById("btn-attach-image");
@@ -73,6 +74,19 @@ function updateSendBtn() {
   btn.disabled = false;
   btn.innerHTML = isStreaming ? STOP_ICON : SEND_ICON;
   btn.title = isStreaming ? "Stop generation" : "Send";
+
+  updateModelActionButtons();
+}
+
+function updateModelActionButtons() {
+  const loadBtn = loadModelBtn();
+  const unloadBtn = unloadModelBtn();
+  if (loadBtn) {
+    loadBtn.disabled = isStreaming || !modelSelect().value;
+  }
+  if (unloadBtn) {
+    unloadBtn.disabled = isStreaming || !state.modelLoaded;
+  }
 }
 
 async function refreshVisionAvailability(modelId = state.currentModelId) {
@@ -179,8 +193,8 @@ async function refreshModelSelector(preselect) {
     });
     if (prev && models.find(m => m.id === prev)) {
       select.value = prev;
-      loadModelBtn().disabled = false;
     }
+    updateModelActionButtons();
   } catch (e) {
     console.error("Failed to load models:", e);
   }
@@ -194,9 +208,9 @@ async function syncLoadedState() {
       state.currentModelId = status.model_id;
       state.modelLoaded = true;
       modelSelect().value = status.model_id;
-      loadModelBtn().disabled = false;
       updateModelStatus("ready", "Model ready");
       await refreshVisionAvailability(status.model_id);
+      updateModelActionButtons();
     }
   } catch (_) {}
 }
@@ -561,7 +575,39 @@ async function loadModel() {
   } finally {
     btn.disabled = false;
     btn.textContent = "Load";
+    updateModelActionButtons();
     updateSendBtn();
+  }
+}
+
+async function unloadModel() {
+  if (isStreaming) {
+    toast("Stop generation before ejecting the model.", "error", 2800);
+    return;
+  }
+
+  const btn = unloadModelBtn();
+  if (!btn) return;
+
+  const prevText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Ejecting…";
+
+  try {
+    await api("/api/model/unload", { method: "POST" });
+    state.modelLoaded = false;
+    state.modelVisionCapable = false;
+    state.currentModelId = null;
+    clearPendingImage();
+    updateModelStatus("", "Model unloaded");
+    inputEl().placeholder = "Load a model to start chatting…";
+    await refreshVisionAvailability(null);
+    toast("Model ejected", "success");
+  } catch (e) {
+    toast(e.message, "error");
+  } finally {
+    btn.textContent = prevText || "Eject";
+    updateModelActionButtons();
   }
 }
 
@@ -610,11 +656,12 @@ export async function initChat() {
   input.addEventListener("input", e => autoResize(e.target));
 
   modelSelect().addEventListener("change", () => {
-    loadModelBtn().disabled = !modelSelect().value;
     state.currentModelId = modelSelect().value || null;
     refreshVisionAvailability(state.currentModelId);
+    updateModelActionButtons();
   });
   loadModelBtn().addEventListener("click", loadModel);
+  unloadModelBtn()?.addEventListener("click", unloadModel);
 
   document.getElementById("btn-settings").addEventListener("click", openSettings);
   document.getElementById("btn-close-settings").addEventListener("click", closeSettings);
@@ -682,5 +729,6 @@ async function _asyncInit() {
     await refreshVisionAvailability(state.currentModelId);
   }
 
+  updateModelActionButtons();
   updateSendBtn();
 }
