@@ -26,6 +26,24 @@ function fmtSize(gb, estimated) {
   return estimated ? `~${gb} GB` : `${gb} GB`;
 }
 
+function renderTagChips(model) {
+  const tags = Array.isArray(model.tags) ? model.tags.slice(0, 4) : [];
+  const chips = [];
+
+  if (model.vision) {
+    chips.push('<span class="tag-chip vision">Vision</span>');
+  }
+
+  tags.forEach(t => {
+    if (!t) return;
+    const norm = String(t).toLowerCase();
+    if (norm === "vision" || norm === "image-text-to-text" || norm === "image-to-text") return;
+    chips.push(`<span class="tag-chip">${escHtml(String(t))}</span>`);
+  });
+
+  return chips.join("");
+}
+
 // ── Memory info ────────────────────────────────────────────────────────────────
 async function refreshMemoryInfo() {
   try {
@@ -74,6 +92,7 @@ function buildLocalCard(m) {
         ${gpuBadge(m.gpu_label)}
         ${loaded ? '<span class="gpu-badge full">Loaded</span>' : ""}
       </div>
+      <div class="model-tag-row">${renderTagChips(m)}</div>
     </div>
     <div class="model-card-actions">
       <button class="btn-outline btn-load-local" data-id="${m.id}">
@@ -238,8 +257,8 @@ async function searchModels(query = "", sort = _currentSort) {
 
   models.forEach(m => container.appendChild(buildSearchCard(m, localIds.has(m.id))));
 
-  // Lazily fetch real sizes in background (sequential, 80 ms apart, memory-light)
-  _fetchSizesLazily(models.filter(m => m.est_size_gb == null && !localIds.has(m.id)));
+  // Lazily fetch real sizes in background for cards without exact size.
+  _fetchSizesLazily(models.filter(m => m.size_gb == null && !localIds.has(m.id)));
 }
 
 async function _fetchSizesLazily(models) {
@@ -285,10 +304,10 @@ function buildSearchCard(m, alreadyLocal) {
     ? `${(m.downloads / 1000).toFixed(1)}k ↓`
     : `${m.downloads} ↓`;
 
-  // Size: show estimated (with ~) until real size loads
-  const sizeStr = m.est_size_gb != null
-    ? fmtSize(m.est_size_gb, true)
-    : "…";
+  // Size: exact first; estimate only as fallback.
+  const sizeStr = m.size_gb != null
+    ? fmtSize(m.size_gb, false)
+    : (m.est_size_gb != null ? fmtSize(m.est_size_gb, true) : "…");
 
   card.innerHTML = `
     <div class="model-card-info">
@@ -299,6 +318,7 @@ function buildSearchCard(m, alreadyLocal) {
         ${m.publisher ? `<span class="publisher-badge">${escHtml(m.publisher)}</span>` : ""}
         <span class="model-card-size">${downloads}</span>
       </div>
+      <div class="model-tag-row">${renderTagChips(m)}</div>
     </div>
     <div class="model-card-actions" id="actions-${CSS.escape(m.id)}">
       ${alreadyLocal

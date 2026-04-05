@@ -24,6 +24,10 @@ _download_lock = threading.Lock()
 _size_cache: Dict[str, Optional[float]] = {}
 _SIZE_CACHE_MAX = 500
 
+# Capability cache (vision/text-only)
+_cap_cache: Dict[str, Dict[str, Any]] = {}
+_CAP_CACHE_MAX = 500
+
 # ── Publisher detection ──────────────────────────────────────────────────────
 
 # Map HF organization slugs → display names
@@ -91,6 +95,16 @@ _NAME_PUBLISHERS = [
     (["yi-"],            "01.AI"),
 ]
 
+_VISION_TAG_HINTS = {
+    "image-text-to-text",
+    "image-to-text",
+    "visual-question-answering",
+    "vision",
+    "vision-language",
+    "multimodal",
+    "vlm",
+}
+
 
 def _publisher_from_base_models(base_models: Any) -> Optional[str]:
     """Extract publisher from the HF baseModels expand field."""
@@ -114,6 +128,16 @@ def _publisher_from_name(name: str) -> Optional[str]:
         if any(kw in name_lower for kw in keywords):
             return pub
     return None
+
+
+def _has_vision(tags: List[str], name: str = "") -> bool:
+    tag_set = {str(t).lower() for t in (tags or [])}
+    if any(t in tag_set for t in _VISION_TAG_HINTS):
+        return True
+
+    name_l = (name or "").lower()
+    name_hints = ("-vl", "vision", "internvl", "llava", "moondream", "qwen-vl", "qwen2-vl", "qwen2.5-vl", "qwen3-vl")
+    return any(h in name_l for h in name_hints)
 
 
 # ── Size estimation ───────────────────────────────────────────────────────────
@@ -180,6 +204,46 @@ def fetch_model_size(model_id: str) -> Optional[float]:
     return size
 
 
+def get_model_capabilities(model_id: str) -> Dict[str, Any]:
+    """Fetch model capabilities from HF metadata (cached)."""
+    if model_id in _cap_cache:
+        return _cap_cache[model_id]
+
+    import requests
+
+    tags: List[str] = []
+    pipeline_tag = None
+    vision = False
+
+    try:
+        resp = requests.get(
+            f"{_HF_API}/{model_id}",
+            params={"expand[]": ["tags", "pipeline_tag"]},
+            timeout=8,
+            headers={"User-Agent": "mlx-chat/1.0"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        tags = list(data.get("tags") or [])
+        pipeline_tag = data.get("pipeline_tag")
+        if pipeline_tag:
+            tags.append(str(pipeline_tag))
+    except Exception:
+        pass
+
+    vision = _has_vision(tags, model_id)
+    result = {
+        "model_id": model_id,
+        "vision": vision,
+        "tags": sorted(set(tags), key=lambda x: str(x).lower())[:16],
+    }
+
+    if len(_cap_cache) >= _CAP_CACHE_MAX:
+        del _cap_cache[next(iter(_cap_cache))]
+    _cap_cache[model_id] = result
+    return result
+
+
 # ── Memory helpers ───────────────────────────────────────────────────────────
 
 def get_system_memory() -> Dict[str, float]:
@@ -221,11 +285,13 @@ def list_local_models() -> List[Dict[str, Any]]:
         if not repo.repo_id.startswith(f"{MLX_ORG}/"):
             continue
         size_gb = repo.size_on_disk / _GiB
+        vision = _has_vision([], repo.repo_id)
         results.append({
             "id":        repo.repo_id,
             "name":      repo.repo_id.split("/", 1)[-1],
             "size_gb":   round(size_gb, 2),
             "gpu_label": _gpu_label(size_gb),
+            "vision":    vision,
         })
     return results
 
@@ -271,6 +337,7 @@ def search_models(query: str = "", sort: str = "downloads", limit: int = 30) -> 
         ("limit",     limit),
         ("expand[]",  "baseModels"),
         ("expand[]",  "lastModified"),
+        ("expand[]",  "pipeline_tag"),
     ]
     if query:
         params.append(("search", query))
@@ -295,7 +362,13 @@ def search_models(query: str = "", sort: str = "downloads", limit: int = 30) -> 
 
         name = model_id.split("/", 1)[-1]
 
-        # Size: estimate from name (actual size fetched lazily per card)
+        # Size: list endpoint does not provide usedStorage reliably.
+        # Exact size is fetched lazily via /api/models/size.
+        used_storage = m.get("usedStorage")
+        size_gb = None
+        if isinstance(used_storage, (int, float)) and used_storage > 0:
+            size_gb = round(float(used_storage) / _GiB, 2)
+
         est_size = _estimate_size_gb(name)
 
         # Publisher: from base_models expand, fallback to name keywords
@@ -304,6 +377,11 @@ def search_models(query: str = "", sort: str = "downloads", limit: int = 30) -> 
             or _publisher_from_name(name)
         )
 
+        tags = [str(t) for t in (m.get("tags") or [])[:12]]
+        if m.get("pipeline_tag"):
+            tags.append(str(m.get("pipeline_tag")))
+        vision = _has_vision(tags, name)
+
         results.append({
             "id":            model_id,
             "name":          name,
@@ -311,10 +389,11 @@ def search_models(query: str = "", sort: str = "downloads", limit: int = 30) -> 
             "likes":         m.get("likes") or 0,
             "last_modified": m.get("lastModified", ""),
             "est_size_gb":   est_size,        # estimated, shown with ~
-            "size_gb":       None,            # real size fetched lazily
-            "gpu_label":     _gpu_label(est_size),
+            "size_gb":       size_gb,
+            "gpu_label":     _gpu_label(size_gb if size_gb is not None else est_size),
             "publisher":     publisher,
-            "tags":          (m.get("tags") or [])[:8],
+            "tags":          sorted(set(tags), key=lambda x: x.lower())[:8],
+            "vision":        vision,
         })
     return results
 

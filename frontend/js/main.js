@@ -10,11 +10,12 @@ import { initModels } from "./models.js";
 export const state = {
   currentModelId: null,
   modelLoaded: false,
+  modelVisionCapable: false,
   currentConvId: null,
 };
 
 // ── View routing ──────────────────────────────────────────────────────────────
-function switchView(name) {
+export function switchView(name) {
   document.querySelectorAll(".view").forEach(v => v.classList.remove("active"));
   document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.view === name));
   const view = document.getElementById(`view-${name}`);

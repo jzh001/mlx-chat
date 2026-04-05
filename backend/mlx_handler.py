@@ -63,7 +63,7 @@ def unload_model() -> None:
 
 
 def stream_chat(
-    messages: List[Dict[str, str]],
+    messages: List[Dict[str, Any]],
     temperature: float = 0.7,
     top_p: float = 0.9,
     max_tokens: int = 2048,
@@ -71,6 +71,9 @@ def stream_chat(
     repetition_context_size: int = 20,
     use_turboquant: bool = False,
     kv_bits: float = 4.0,
+    image: Any = None,
+    num_images: int = 0,
+    stop_event: Optional[threading.Event] = None,
 ) -> Generator[str, None, None]:
     """Yield text chunks for the assistant reply to the given messages."""
     if _model is None or _processor is None or _config is None:
@@ -79,7 +82,7 @@ def stream_chat(
     from mlx_vlm.prompt_utils import apply_chat_template
     from mlx_vlm import stream_generate
 
-    prompt = apply_chat_template(_processor, _config, messages, num_images=0)
+    prompt = apply_chat_template(_processor, _config, messages, num_images=num_images)
 
     kwargs: Dict[str, Any] = {
         "max_tokens": max_tokens,
@@ -94,7 +97,9 @@ def stream_chat(
         kwargs["kv_quant_scheme"] = "turboquant"
 
     last_chunk = None
-    for chunk in stream_generate(_model, _processor, prompt, image=None, **kwargs):
+    for chunk in stream_generate(_model, _processor, prompt, image=image, **kwargs):
+        if stop_event is not None and stop_event.is_set():
+            break
         last_chunk = chunk
         if hasattr(chunk, "text"):
             yield chunk.text

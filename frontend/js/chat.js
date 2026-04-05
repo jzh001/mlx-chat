@@ -1,7 +1,7 @@
 /**
  * Chat module – handles conversation UI, streaming, settings panel.
  */
-import { api, toast, state } from "./main.js";
+import { api, toast, state, switchView } from "./main.js";
 
 // ── Markdown / math renderer ──────────────────────────────────────────────────
 function renderMarkdown(text) {
@@ -41,17 +41,127 @@ const modelSelect  = () => document.getElementById("model-select");
 const loadModelBtn = () => document.getElementById("btn-load-model");
 const modelStatus  = () => document.getElementById("model-status");
 const welcomeEl    = () => document.getElementById("welcome");
+const attachImageBtn = () => document.getElementById("btn-attach-image");
+const imageInputEl = () => document.getElementById("image-upload");
+const imagePreviewRowEl = () => document.getElementById("image-preview-row");
+const imagePreviewCardEl = () => document.getElementById("image-preview-card");
 
 // ── Per-conversation message history ──────────────────────────────────────────
 let messages = [];
 let isStreaming = false;
+let currentStreamController = null;
+let currentRequestId = null;
+let pendingImageDataUrl = null;
+
+const SEND_ICON = `
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+    <line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+  </svg>`;
+
+const STOP_ICON = `
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+    <rect x="6" y="6" width="12" height="12" rx="2" ry="2"></rect>
+  </svg>`;
 
 // ── Input state ───────────────────────────────────────────────────────────────
 // Textarea is always enabled for a responsive feel.
 // Sending without a loaded model shows a toast instead of silently doing nothing.
 function updateSendBtn() {
   const btn = sendBtnEl();
-  if (btn) btn.disabled = isStreaming;
+  if (!btn) return;
+
+  btn.disabled = false;
+  btn.innerHTML = isStreaming ? STOP_ICON : SEND_ICON;
+  btn.title = isStreaming ? "Stop generation" : "Send";
+}
+
+async function refreshVisionAvailability(modelId = state.currentModelId) {
+  const attachBtn = attachImageBtn();
+  if (!attachBtn) return;
+
+  state.modelVisionCapable = false;
+  attachBtn.disabled = true;
+  attachBtn.title = "Image upload is available for loaded vision models";
+
+  if (!modelId || !state.modelLoaded) return;
+
+  try {
+    const caps = await api(`/api/models/capabilities/${encodeURIComponent(modelId)}`);
+    state.modelVisionCapable = !!caps.vision;
+    attachBtn.disabled = !state.modelVisionCapable;
+    attachBtn.title = state.modelVisionCapable
+      ? "Attach image"
+      : "This model does not advertise vision support";
+    if (!state.modelVisionCapable) clearPendingImage();
+  } catch (_) {}
+}
+
+function clearPendingImage() {
+  pendingImageDataUrl = null;
+  const row = imagePreviewRowEl();
+  const card = imagePreviewCardEl();
+  const input = imageInputEl();
+  if (card) card.innerHTML = "";
+  if (row) row.classList.add("hidden");
+  if (input) input.value = "";
+}
+
+function renderPendingImage(dataUrl) {
+  const row = imagePreviewRowEl();
+  const card = imagePreviewCardEl();
+  if (!row || !card || !dataUrl) return;
+
+  card.innerHTML = `
+    <img src="${dataUrl}" alt="upload preview" class="preview-thumb" />
+    <button class="preview-remove" id="btn-remove-image" title="Remove image">×</button>
+  `;
+  row.classList.remove("hidden");
+  document.getElementById("btn-remove-image")?.addEventListener("click", clearPendingImage);
+}
+
+async function compressImageToDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        const maxSide = 1280;
+        const scale = Math.min(1, maxSide / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return reject(new Error("Could not process image"));
+        ctx.drawImage(img, 0, 0, w, h);
+
+        resolve(canvas.toDataURL("image/jpeg", 0.86));
+      };
+      img.onerror = () => reject(new Error("Invalid image file"));
+      img.src = String(fr.result || "");
+    };
+    fr.onerror = () => reject(new Error("Failed to read image file"));
+    fr.readAsDataURL(file);
+  });
+}
+
+async function stopCurrentGeneration() {
+  if (!isStreaming) return;
+
+  try {
+    if (currentRequestId) {
+      await api("/api/chat/stop", {
+        method: "POST",
+        body: JSON.stringify({ request_id: currentRequestId }),
+      });
+    }
+  } catch (_) {
+    // Best effort. We still abort client-side below.
+  }
+
+  currentStreamController?.abort();
 }
 
 // ── Model selector ────────────────────────────────────────────────────────────
@@ -86,6 +196,7 @@ async function syncLoadedState() {
       modelSelect().value = status.model_id;
       loadModelBtn().disabled = false;
       updateModelStatus("ready", "Model ready");
+      await refreshVisionAvailability(status.model_id);
     }
   } catch (_) {}
 }
@@ -97,7 +208,7 @@ function updateModelStatus(stateStr, message) {
 }
 
 // ── Message rendering ─────────────────────────────────────────────────────────
-function addMessage(role, content, streaming = false) {
+function addMessage(role, content, streaming = false, imageDataUrl = null) {
   welcomeEl()?.remove();
 
   const el = document.createElement("div");
@@ -113,7 +224,15 @@ function addMessage(role, content, streaming = false) {
   if (streaming) {
     contentEl.classList.add("streaming-cursor");
   } else {
-    contentEl.innerHTML = renderMarkdown(content);
+    if (imageDataUrl) {
+      const img = document.createElement("img");
+      img.src = imageDataUrl;
+      img.alt = "uploaded image";
+      img.className = "chat-inline-image";
+      contentEl.appendChild(img);
+    }
+
+    contentEl.innerHTML += renderMarkdown(content || "");
     renderMath(contentEl);
   }
 
@@ -158,18 +277,32 @@ function renderStats(contentEl, stats, elapsed) {
 async function sendMessage() {
   const input = inputEl();
   const text = input.value.trim();
-  if (!text || isStreaming) return;
+  if (isStreaming) {
+    await stopCurrentGeneration();
+    return;
+  }
+
+  if (!text && !pendingImageDataUrl) return;
 
   if (!state.modelLoaded) {
     toast("Load a model first — select one and click Load.", "error", 4000);
     return;
   }
 
+  if (pendingImageDataUrl && !state.modelVisionCapable) {
+    toast("Selected model does not support image inputs.", "error", 3500);
+    return;
+  }
+
   input.value = "";
   input.style.height = "auto";
 
-  addMessage("user", text);
-  messages.push({ role: "user", content: text });
+  const userMsg = { role: "user", content: text };
+  if (pendingImageDataUrl) userMsg.image_data_url = pendingImageDataUrl;
+
+  addMessage("user", text, false, pendingImageDataUrl);
+  messages.push(userMsg);
+  clearPendingImage();
 
   isStreaming = true;
   updateSendBtn();
@@ -178,6 +311,8 @@ async function sendMessage() {
   let assistantText = "";
   let pendingStats = null;
   const t0 = performance.now();
+  currentRequestId = crypto.randomUUID();
+  currentStreamController = new AbortController();
 
   try {
     const settings = collectSettings();
@@ -186,13 +321,18 @@ async function sendMessage() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         conversation_id: state.currentConvId,
+        request_id: currentRequestId,
         model_id: state.currentModelId,
         messages: [...messages],
         settings,
       }),
+      signal: currentStreamController.signal,
     });
 
-    if (!res.ok) throw new Error(`Server error: ${res.status}`);
+    if (!res.ok) {
+      const errBody = await res.json().catch(() => ({}));
+      throw new Error(errBody.detail || `Server error: ${res.status}`);
+    }
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -221,6 +361,8 @@ async function sendMessage() {
           } else if (event.type === "done") {
             state.currentConvId = event.conversation_id;
             await loadConversationList();
+          } else if (event.type === "stopped") {
+            toast("Generation stopped", "info", 1200);
           } else if (event.type === "error") {
             toast(event.message, "error");
           }
@@ -237,15 +379,29 @@ async function sendMessage() {
     const elapsed = (performance.now() - t0) / 1000;
     renderStats(assistantContentEl, pendingStats, elapsed);
 
-    messages.push({ role: "assistant", content: assistantText });
+    if (assistantText.trim()) {
+      messages.push({ role: "assistant", content: assistantText });
+    } else {
+      assistantContentEl.remove();
+    }
 
   } catch (err) {
+    if (err.name === "AbortError") {
+      assistantContentEl.classList.remove("streaming-cursor");
+      if (!assistantText.trim()) {
+        assistantContentEl.remove();
+      }
+      return;
+    }
+
     assistantContentEl.classList.remove("streaming-cursor");
     assistantContentEl.innerHTML =
       `<span style="color:var(--danger)">Error: ${err.message}</span>`;
     toast(err.message, "error");
   } finally {
     isStreaming = false;
+    currentRequestId = null;
+    currentStreamController = null;
     updateSendBtn();
   }
 }
@@ -293,17 +449,18 @@ async function loadConversation(convId) {
     const container = messagesEl();
     container.innerHTML = "";
     messages.forEach(m => {
-      if (m.role !== "system") addMessage(m.role, m.content);
+      if (m.role !== "system") addMessage(m.role, m.content, false, m.image_data_url || null);
     });
 
     document.querySelectorAll(".conv-item").forEach(el =>
       el.classList.toggle("active", el.dataset.id === convId));
 
-    document.getElementById("view-chat").classList.add("active");
+    switchView("chat");
 
     if (conv.model) {
       const select = modelSelect();
       if ([...select.options].some(o => o.value === conv.model)) select.value = conv.model;
+      await refreshVisionAvailability(conv.model);
     }
   } catch (e) {
     toast("Failed to load conversation", "error");
@@ -311,8 +468,10 @@ async function loadConversation(convId) {
 }
 
 export function startNewConversation() {
+  if (isStreaming) stopCurrentGeneration();
   state.currentConvId = null;
   messages = [];
+  clearPendingImage();
   messagesEl().innerHTML = `
     <div id="welcome" class="welcome">
       <div class="welcome-icon">
@@ -391,10 +550,12 @@ async function loadModel() {
     });
     state.currentModelId = modelId;
     state.modelLoaded = true;
+    await refreshVisionAvailability(modelId);
     updateModelStatus("ready", "Model ready");
     toast("Model loaded", "success");
   } catch (e) {
     state.modelLoaded = false;
+    state.modelVisionCapable = false;
     updateModelStatus("error", "Failed to load");
     toast(e.message, "error");
   } finally {
@@ -419,6 +580,30 @@ export async function initChat() {
 
   sendBtnEl().addEventListener("click", sendMessage);
 
+  attachImageBtn()?.addEventListener("click", () => {
+    if (!state.modelLoaded) {
+      toast("Load a vision model first", "error", 3000);
+      return;
+    }
+    if (!state.modelVisionCapable) {
+      toast("Selected model is not vision-capable", "error", 3000);
+      return;
+    }
+    imageInputEl()?.click();
+  });
+
+  imageInputEl()?.addEventListener("change", async e => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    try {
+      pendingImageDataUrl = await compressImageToDataUrl(file);
+      renderPendingImage(pendingImageDataUrl);
+    } catch (err) {
+      toast(err.message || "Image upload failed", "error");
+      clearPendingImage();
+    }
+  });
+
   input.addEventListener("keydown", e => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
   });
@@ -426,6 +611,8 @@ export async function initChat() {
 
   modelSelect().addEventListener("change", () => {
     loadModelBtn().disabled = !modelSelect().value;
+    state.currentModelId = modelSelect().value || null;
+    refreshVisionAvailability(state.currentModelId);
   });
   loadModelBtn().addEventListener("click", loadModel);
 
@@ -492,5 +679,8 @@ async function _asyncInit() {
   // Update placeholder based on whether model is ready
   if (state.modelLoaded) {
     inputEl().placeholder = "Message…";
+    await refreshVisionAvailability(state.currentModelId);
   }
+
+  updateSendBtn();
 }

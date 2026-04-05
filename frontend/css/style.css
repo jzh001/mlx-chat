@@ -345,6 +345,54 @@ select:focus { outline: none; border-color: var(--accent); }
   border-top: 1px solid var(--border-light);
 }
 
+.image-preview-row {
+  display: flex;
+  margin-bottom: 8px;
+}
+
+.image-preview-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 6px;
+}
+
+.preview-thumb {
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+.preview-remove {
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 50%;
+  background: var(--surface-2);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.preview-remove:hover {
+  color: var(--danger);
+}
+
+.chat-inline-image {
+  max-width: min(460px, 100%);
+  max-height: 320px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  display: block;
+  margin-bottom: 10px;
+}
+
 .input-wrap {
   display: flex;
   align-items: flex-end;
@@ -543,6 +591,29 @@ select:focus { outline: none; border-color: var(--accent); }
   align-items: center;
   gap: 10px;
   margin-top: 4px;
+}
+
+.model-tag-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.tag-chip {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: 20px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  background: var(--surface-2);
+}
+
+.tag-chip.vision {
+  color: #1f88ff;
+  border-color: rgba(31, 136, 255, 0.35);
+  background: rgba(31, 136, 255, 0.14);
 }
 .model-card-size {
   font-size: 12px;

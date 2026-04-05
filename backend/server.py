@@ -1,12 +1,15 @@
 import asyncio
+import base64
 import json
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,6 +17,8 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 _thread_pool = ThreadPoolExecutor(max_workers=4)
+_stop_events_lock = threading.Lock()
+_stop_events: Dict[str, threading.Event] = {}
 
 from . import config as cfg
 from . import mlx_handler as mlx
@@ -172,32 +177,97 @@ def delete_conversation(conv_id: str):
 
 class ChatRequest(BaseModel):
     conversation_id: Optional[str] = None
+    request_id: Optional[str] = None
     model_id: str
-    messages: List[Dict[str, str]]
+    messages: List[Dict[str, Any]]
     settings: Optional[Dict[str, Any]] = None
 
 
+class StopRequest(BaseModel):
+    request_id: str
+
+
+def _decode_data_url_image(data_url: str):
+    if not data_url or "," not in data_url:
+        return None
+
+    try:
+        _, b64 = data_url.split(",", 1)
+        raw = base64.b64decode(b64)
+        from PIL import Image
+        return Image.open(BytesIO(raw)).convert("RGB")
+    except Exception:
+        return None
+
+
+@app.get("/api/models/capabilities/{model_id:path}")
+async def model_capabilities(model_id: str):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_thread_pool, lambda: mm.get_model_capabilities(model_id))
+
+
+@app.post("/api/chat/stop")
+def stop_chat(req: StopRequest):
+    with _stop_events_lock:
+        ev = _stop_events.get(req.request_id)
+    if ev:
+        ev.set()
+    return {"stopped": bool(ev)}
+
+
 @app.post("/api/chat/stream")
-async def chat_stream(req: ChatRequest):
+async def chat_stream(req: ChatRequest, request: Request):
     # Merge default settings
     base = cfg.load_settings(req.model_id)
     settings = {**base, **(req.settings or {})}
 
-    # Build messages list (include system prompt if set)
-    messages = list(req.messages)
-    if settings.get("system_prompt") and not any(m.get("role") == "system" for m in messages):
-        messages = [{"role": "system", "content": settings["system_prompt"]}] + messages
+    # Build messages list (include system prompt if set), and peel image payload from latest user turn
+    raw_messages = list(req.messages)
+    image_data_url = None
+    for m in reversed(raw_messages):
+        if m.get("role") == "user" and m.get("image_data_url"):
+            image_data_url = m.get("image_data_url")
+            break
+
+    # Enforce capability guard server-side so image uploads cannot be sent to
+    # text-only models via crafted requests or stale client state.
+    if image_data_url:
+        loop = asyncio.get_event_loop()
+        caps = await loop.run_in_executor(_thread_pool, lambda: mm.get_model_capabilities(req.model_id))
+        if not caps.get("vision", False):
+            raise HTTPException(
+                status_code=400,
+                detail="Selected model does not support vision/image inputs.",
+            )
+
+    model_messages: List[Dict[str, str]] = []
+    for m in raw_messages:
+        role = m.get("role")
+        content = m.get("content", "")
+        if role in ("system", "user", "assistant"):
+            model_messages.append({"role": role, "content": content})
+
+    if settings.get("system_prompt") and not any(m.get("role") == "system" for m in model_messages):
+        model_messages = [{"role": "system", "content": settings["system_prompt"]}] + model_messages
 
     conv_id = req.conversation_id or str(uuid.uuid4())
+    req_id = req.request_id or str(uuid.uuid4())
+    stop_event = threading.Event()
+    with _stop_events_lock:
+        _stop_events[req_id] = stop_event
 
     async def generate():
         full_text = ""
+        stopped = False
         try:
             loop = asyncio.get_event_loop()
 
+            pil_image = _decode_data_url_image(image_data_url) if image_data_url else None
+            num_images = 1 if pil_image is not None else 0
+
             def _stream():
                 return mlx.stream_chat(
-                    messages=messages,
+                    messages=model_messages,
                     temperature=float(settings.get("temperature", 0.7)),
                     top_p=float(settings.get("top_p", 0.9)),
                     max_tokens=int(settings.get("max_tokens", 2048)),
@@ -205,6 +275,9 @@ async def chat_stream(req: ChatRequest):
                     repetition_context_size=int(settings.get("repetition_context_size", 20)),
                     use_turboquant=bool(settings.get("use_turboquant", False)),
                     kv_bits=float(settings.get("kv_bits", 4.0)),
+                    image=pil_image,
+                    num_images=num_images,
+                    stop_event=stop_event,
                 )
 
             # Run synchronous generator in thread pool
@@ -232,6 +305,9 @@ async def chat_stream(req: ChatRequest):
 
                 gen_stats = None
                 while True:
+                    if await request.is_disconnected():
+                        stop_event.set()
+
                     kind, data = await chunk_queue.get()
                     if kind == "chunk":
                         full_text += data
@@ -244,18 +320,34 @@ async def chat_stream(req: ChatRequest):
                     else:
                         break
 
+                    if stop_event.is_set():
+                        stopped = True
+                        break
+
                 if gen_stats:
                     yield {"data": json.dumps({"type": "stats", **gen_stats})}
+
+            if stop_event.is_set():
+                stopped = True
 
         except Exception as e:
             yield {"data": json.dumps({"type": "error", "message": str(e)})}
             return
+        finally:
+            with _stop_events_lock:
+                _stop_events.pop(req_id, None)
 
         # Persist conversation
         now = datetime.now(timezone.utc).isoformat()
         user_messages = [m for m in req.messages if m.get("role") != "system"]
-        title = (user_messages[0]["content"][:60] if user_messages else "Chat")
-        all_messages = list(req.messages) + [{"role": "assistant", "content": full_text}]
+        title = "Chat"
+        if user_messages:
+            first_content = (user_messages[0].get("content") or "").strip()
+            title = first_content[:60] if first_content else "Image chat"
+
+        all_messages = list(req.messages)
+        if full_text.strip():
+            all_messages.append({"role": "assistant", "content": full_text})
 
         conv = cfg.load_conversation(conv_id) or {
             "id": conv_id,
@@ -266,6 +358,9 @@ async def chat_stream(req: ChatRequest):
         conv["messages"] = all_messages
         conv["updated_at"] = now
         cfg.save_conversation(conv)
+
+        if stopped:
+            yield {"data": json.dumps({"type": "stopped"})}
 
         yield {"data": json.dumps({"type": "done", "conversation_id": conv_id})}
 
