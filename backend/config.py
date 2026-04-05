@@ -80,3 +80,17 @@ def delete_conversation(conv_id: str) -> bool:
         p.unlink()
         return True
     return False
+
+
+_LAST_MODEL_FILE = APP_DIR / "last_model.txt"
+
+
+def get_last_model() -> str | None:
+    if _LAST_MODEL_FILE.exists():
+        v = _LAST_MODEL_FILE.read_text().strip()
+        return v or None
+    return None
+
+
+def set_last_model(model_id: str) -> None:
+    _LAST_MODEL_FILE.write_text(model_id)

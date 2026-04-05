@@ -1,18 +1,22 @@
 /**
- * Models module – local model list, HuggingFace search, download with progress.
+ * Models module – local model list, HuggingFace search with autocomplete,
+ * download with progress.
  */
 import { api, toast, state } from "./main.js";
 
 let searchTimeout = null;
 let downloadPollers = {};
 
+// Pre-loaded suggestion pool (model names from mlx-community)
+let _suggestionPool = [];
+
 // ── GPU label rendering ───────────────────────────────────────────────────────
 function gpuBadge(label) {
   const labels = {
-    full: "Full GPU Offload",
-    partial: "Partial GPU Offload",
+    full:      "Full GPU Offload",
+    partial:   "Partial GPU Offload",
     too_large: "Likely Too Large",
-    unknown: "Size Unknown",
+    unknown:   "Size Unknown",
   };
   return `<span class="gpu-badge ${label}">${labels[label] || label}</span>`;
 }
@@ -29,7 +33,7 @@ async function refreshMemoryInfo() {
     const el = document.getElementById("memory-info");
     if (el) {
       el.textContent =
-        `RAM: ${mem.available_gb.toFixed(1)} GB available / ${mem.total_gb.toFixed(1)} GB total`;
+        `RAM: ${mem.available_gb.toFixed(1)} GB free  /  ${mem.total_gb.toFixed(1)} GB total`;
     }
   } catch (_) {}
 }
@@ -42,16 +46,12 @@ async function refreshLocalModels() {
 
   try {
     const models = await api("/api/models/local");
-
     if (!models.length) {
       container.innerHTML = '<div class="empty-state">No local models found. Download one below.</div>';
       return;
     }
-
     container.innerHTML = "";
-    models.forEach(m => {
-      container.appendChild(buildLocalCard(m));
-    });
+    models.forEach(m => container.appendChild(buildLocalCard(m)));
   } catch (e) {
     container.innerHTML = `<div class="empty-state">Failed to load: ${e.message}</div>`;
   }
@@ -80,7 +80,7 @@ function buildLocalCard(m) {
       <button class="btn-danger btn-delete-local" data-id="${m.id}">Delete</button>
     </div>`;
 
-  card.querySelector(".btn-load-local").addEventListener("click", async (e) => {
+  card.querySelector(".btn-load-local").addEventListener("click", async e => {
     const btn = e.currentTarget;
     if (btn.textContent.trim() === "Loaded") return;
     btn.disabled = true;
@@ -93,18 +93,13 @@ function buildLocalCard(m) {
       state.currentModelId = m.id;
       state.modelLoaded = true;
 
-      // Update chat model selector too
+      // Sync chat header
       const sel = document.getElementById("model-select");
       if (sel) sel.value = m.id;
-      const modelStatus = document.getElementById("model-status");
-      if (modelStatus) {
-        modelStatus.textContent = "Model ready";
-        modelStatus.className = "model-status ready";
-      }
-      const userInput = document.getElementById("user-input");
-      if (userInput) userInput.disabled = false;
-      const sendBtn = document.getElementById("btn-send");
-      if (sendBtn) sendBtn.disabled = false;
+      const ms = document.getElementById("model-status");
+      if (ms) { ms.textContent = "Model ready"; ms.className = "model-status ready"; }
+      const inp = document.getElementById("user-input");
+      if (inp) inp.placeholder = "Message…";
 
       toast("Model loaded", "success");
       btn.textContent = "Loaded";
@@ -115,7 +110,7 @@ function buildLocalCard(m) {
     }
   });
 
-  card.querySelector(".btn-delete-local").addEventListener("click", async (e) => {
+  card.querySelector(".btn-delete-local").addEventListener("click", async e => {
     if (!confirm(`Delete ${m.name}?`)) return;
     const btn = e.currentTarget;
     btn.disabled = true;
@@ -123,13 +118,9 @@ function buildLocalCard(m) {
     try {
       await api(`/api/models/${encodeURIComponent(m.id)}`, { method: "DELETE" });
       card.remove();
-      if (state.currentModelId === m.id) {
-        state.currentModelId = null;
-        state.modelLoaded = false;
-      }
+      if (state.currentModelId === m.id) { state.currentModelId = null; state.modelLoaded = false; }
       toast("Model deleted", "success");
-      // Refresh model selector
-      await refreshSelectModels();
+      await _refreshChatSelector();
     } catch (err) {
       toast(err.message, "error");
       btn.disabled = false;
@@ -140,7 +131,7 @@ function buildLocalCard(m) {
   return card;
 }
 
-async function refreshSelectModels() {
+async function _refreshChatSelector() {
   try {
     const models = await api("/api/models/local");
     const select = document.getElementById("model-select");
@@ -157,7 +148,60 @@ async function refreshSelectModels() {
   } catch (_) {}
 }
 
-// ── Search models ──────────────────────────────────────────────────────────────
+// ── Search + autocomplete ──────────────────────────────────────────────────────
+async function _loadSuggestionPool() {
+  if (_suggestionPool.length) return; // already loaded
+  try {
+    const models = await api("/api/models/search?limit=100");
+    _suggestionPool = models.map(m => m.id); // full IDs like "mlx-community/foo"
+  } catch (_) {}
+}
+
+function _filterSuggestions(query) {
+  if (!query) return [];
+  const q = query.toLowerCase();
+  return _suggestionPool
+    .filter(id => id.toLowerCase().includes(q))
+    .slice(0, 8);
+}
+
+function _showSuggestions(inputEl, dropdownEl, query) {
+  const matches = _filterSuggestions(query);
+  if (!matches.length || !query) {
+    dropdownEl.classList.add("hidden");
+    return;
+  }
+  dropdownEl.innerHTML = "";
+  matches.forEach(id => {
+    const name = id.split("/").pop();
+    const item = document.createElement("div");
+    item.className = "suggestion-item";
+    // Bold the matching part
+    const idx = name.toLowerCase().indexOf(query.toLowerCase());
+    if (idx >= 0) {
+      item.innerHTML =
+        escHtml(name.slice(0, idx)) +
+        `<strong>${escHtml(name.slice(idx, idx + query.length))}</strong>` +
+        escHtml(name.slice(idx + query.length));
+    } else {
+      item.textContent = name;
+    }
+    item.addEventListener("mousedown", e => {
+      e.preventDefault(); // prevent input blur before click fires
+      inputEl.value = name;
+      dropdownEl.classList.add("hidden");
+      searchModels(name);
+    });
+    dropdownEl.appendChild(item);
+  });
+  dropdownEl.classList.remove("hidden");
+}
+
+function escHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ── HuggingFace search ────────────────────────────────────────────────────────
 async function searchModels(query = "") {
   const container = document.getElementById("search-results");
   if (!container) return;
@@ -175,17 +219,10 @@ async function searchModels(query = "") {
     }
 
     container.innerHTML = "";
-
-    // Get local model IDs for "already downloaded" indication
     let localIds = new Set();
-    try {
-      const local = await api("/api/models/local");
-      localIds = new Set(local.map(m => m.id));
-    } catch (_) {}
+    try { localIds = new Set((await api("/api/models/local")).map(m => m.id)); } catch (_) {}
 
-    models.forEach(m => {
-      container.appendChild(buildSearchCard(m, localIds.has(m.id)));
-    });
+    models.forEach(m => container.appendChild(buildSearchCard(m, localIds.has(m.id))));
   } catch (e) {
     container.innerHTML = `<div class="empty-state">Search failed: ${e.message}</div>`;
   }
@@ -197,8 +234,8 @@ function buildSearchCard(m, alreadyLocal) {
   card.id = `search-card-${CSS.escape(m.id)}`;
 
   const downloads = m.downloads > 1000
-    ? `${(m.downloads / 1000).toFixed(1)}k downloads`
-    : `${m.downloads} downloads`;
+    ? `${(m.downloads / 1000).toFixed(1)}k ↓`
+    : `${m.downloads} ↓`;
 
   card.innerHTML = `
     <div class="model-card-info">
@@ -216,14 +253,13 @@ function buildSearchCard(m, alreadyLocal) {
     </div>`;
 
   if (!alreadyLocal) {
-    card.querySelector(".btn-download").addEventListener("click", async (e) => {
+    card.querySelector(".btn-download").addEventListener("click", async e => {
       const btn = e.currentTarget;
       btn.disabled = true;
       btn.textContent = "Starting…";
       await startDownload(m.id, card);
     });
   }
-
   return card;
 }
 
@@ -235,7 +271,6 @@ async function startDownload(modelId, card) {
     });
     toast(`Downloading ${modelId.split("/").pop()}…`, "info", 5000);
 
-    // Replace action area with progress bar
     const actionsEl = card.querySelector(`#actions-${CSS.escape(modelId)}`);
     if (actionsEl) {
       actionsEl.innerHTML = `
@@ -246,12 +281,8 @@ async function startDownload(modelId, card) {
           <span class="progress-text" id="prog-text-${CSS.escape(modelId)}">0%</span>
         </div>`;
     }
-
-    // Poll progress
     pollDownload(modelId, card);
-  } catch (e) {
-    toast(e.message, "error");
-  }
+  } catch (e) { toast(e.message, "error"); }
 }
 
 function pollDownload(modelId, card) {
@@ -262,10 +293,11 @@ function pollDownload(modelId, card) {
       const status = await api(`/api/models/download/status?model_id=${encodeURIComponent(modelId)}`);
       const pct = Math.round(status.progress * 100);
 
-      const bar = document.getElementById(`prog-bar-${CSS.escape(modelId)}`);
-      const text = document.getElementById(`prog-text-${CSS.escape(modelId)}`);
-      if (bar) bar.style.width = pct + "%";
-      if (text) text.textContent = pct + "%";
+      document.getElementById(`prog-bar-${CSS.escape(modelId)}`)?.style.setProperty("width", pct + "%");
+      const txt = document.getElementById(`prog-text-${CSS.escape(modelId)}`);
+      if (txt) txt.textContent = status.current_file
+        ? `${pct}% — ${status.current_file.split("/").pop()}`
+        : pct + "%";
 
       if (status.done) {
         clearInterval(downloadPollers[modelId]);
@@ -273,16 +305,15 @@ function pollDownload(modelId, card) {
 
         if (status.error) {
           toast(`Download failed: ${status.error}`, "error");
-          const actionsEl = card.querySelector(`#actions-${CSS.escape(modelId)}`);
-          if (actionsEl) actionsEl.innerHTML =
+          const actEl = card.querySelector(`#actions-${CSS.escape(modelId)}`);
+          if (actEl) actEl.innerHTML =
             `<button class="btn-primary btn-sm btn-download" data-id="${modelId}">Retry</button>`;
         } else {
           toast(`${modelId.split("/").pop()} downloaded!`, "success");
           await refreshLocalModels();
-          await refreshSelectModels();
-          // Update the card in search results
-          const actionsEl = card.querySelector(`#actions-${CSS.escape(modelId)}`);
-          if (actionsEl) actionsEl.innerHTML = '<span class="gpu-badge full">Downloaded</span>';
+          await _refreshChatSelector();
+          const actEl = card.querySelector(`#actions-${CSS.escape(modelId)}`);
+          if (actEl) actEl.innerHTML = '<span class="gpu-badge full">Downloaded</span>';
         }
       }
     } catch (_) {}
@@ -291,28 +322,54 @@ function pollDownload(modelId, card) {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 export async function initModels() {
-  await refreshMemoryInfo();
-  await refreshLocalModels();
+  refreshMemoryInfo();    // fire-and-forget
+  refreshLocalModels();   // fire-and-forget
 
-  // Lazy: only search when user interacts
   const searchInput = document.getElementById("model-search");
-  const searchBtn = document.getElementById("btn-search");
+  const searchBtn   = document.getElementById("btn-search");
 
   if (searchInput && !searchInput.dataset.initialized) {
     searchInput.dataset.initialized = "1";
 
+    // Create autocomplete dropdown
+    const dropdown = document.createElement("div");
+    dropdown.className = "suggestion-dropdown hidden";
+    searchInput.parentElement.appendChild(dropdown);
+
+    // Pre-load suggestion pool in background
+    _loadSuggestionPool().then(() => {
+      // Once loaded, re-show suggestions for whatever is currently typed
+      if (searchInput.value) _showSuggestions(searchInput, dropdown, searchInput.value);
+    });
+
     searchInput.addEventListener("input", () => {
+      const q = searchInput.value.trim();
+      _showSuggestions(searchInput, dropdown, q);
       clearTimeout(searchTimeout);
-      searchTimeout = setTimeout(() => searchModels(searchInput.value), 400);
+      if (q.length >= 2) {
+        searchTimeout = setTimeout(() => {
+          dropdown.classList.add("hidden");
+          searchModels(q);
+        }, 400);
+      }
     });
 
     searchInput.addEventListener("keydown", e => {
-      if (e.key === "Enter") searchModels(searchInput.value);
+      if (e.key === "Enter") { dropdown.classList.add("hidden"); searchModels(searchInput.value); }
+      if (e.key === "Escape") dropdown.classList.add("hidden");
     });
 
-    searchBtn.addEventListener("click", () => searchModels(searchInput.value));
+    searchInput.addEventListener("blur", () => {
+      // Delay so mousedown on item fires first
+      setTimeout(() => dropdown.classList.add("hidden"), 150);
+    });
 
-    // Initial search to populate
-    await searchModels("");
+    searchBtn.addEventListener("click", () => {
+      dropdown.classList.add("hidden");
+      searchModels(searchInput.value);
+    });
+
+    // Initial popular models
+    searchModels("");
   }
 }

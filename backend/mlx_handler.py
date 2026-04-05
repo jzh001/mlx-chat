@@ -93,12 +93,24 @@ def stream_chat(
         kwargs["kv_bits"] = kv_bits
         kwargs["kv_quant_scheme"] = "turboquant"
 
+    last_chunk = None
     for chunk in stream_generate(_model, _processor, prompt, image=None, **kwargs):
+        last_chunk = chunk
         if hasattr(chunk, "text"):
             yield chunk.text
         elif isinstance(chunk, str):
             yield chunk
         else:
-            # Fallback for unknown chunk types
-            text = getattr(chunk, "text", None) or str(chunk)
-            yield text
+            yield getattr(chunk, "text", None) or str(chunk)
+
+    # Yield final generation statistics from the last chunk
+    if last_chunk is not None:
+        stats = {
+            "prompt_tokens": getattr(last_chunk, "prompt_tokens", None),
+            "generation_tokens": getattr(last_chunk, "generation_tokens", None),
+            "generation_tps": getattr(last_chunk, "generation_tps", None),
+            "prompt_tps": getattr(last_chunk, "prompt_tps", None),
+            "peak_memory_gb": getattr(last_chunk, "peak_memory", None),
+        }
+        if any(v is not None for v in stats.values()):
+            yield {"__stats__": stats}

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,8 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
+
+_thread_pool = ThreadPoolExecutor(max_workers=4)
 
 from . import config as cfg
 from . import mlx_handler as mlx
@@ -45,13 +48,15 @@ def system_memory():
 # ── Model management ─────────────────────────────────────────────────────────
 
 @app.get("/api/models/local")
-def local_models():
-    return mm.list_local_models()
+async def local_models():
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_thread_pool, mm.list_local_models)
 
 
 @app.get("/api/models/search")
-def search_models(q: str = "", limit: int = 30):
-    return mm.search_models(q, limit)
+async def search_models(q: str = "", limit: int = 30):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(_thread_pool, lambda: mm.search_models(q, limit))
 
 
 class DownloadRequest(BaseModel):
@@ -87,10 +92,17 @@ class LoadRequest(BaseModel):
     model_id: str
 
 
+@app.get("/api/settings/last-model")
+def get_last_model():
+    return {"model_id": cfg.get_last_model()}
+
+
 @app.post("/api/model/load")
-def load_model(req: LoadRequest):
+async def load_model(req: LoadRequest):
+    loop = asyncio.get_event_loop()
     try:
-        mlx.load_model(req.model_id)
+        await loop.run_in_executor(_thread_pool, lambda: mlx.load_model(req.model_id))
+        cfg.set_last_model(req.model_id)
         return {"status": "loaded", "model_id": req.model_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -197,7 +209,12 @@ async def chat_stream(req: ChatRequest):
                 def _reader():
                     try:
                         for chunk in gen:
-                            loop.call_soon_threadsafe(chunk_queue.put_nowait, ("chunk", chunk))
+                            if isinstance(chunk, dict) and "__stats__" in chunk:
+                                loop.call_soon_threadsafe(
+                                    chunk_queue.put_nowait, ("stats", chunk["__stats__"])
+                                )
+                            else:
+                                loop.call_soon_threadsafe(chunk_queue.put_nowait, ("chunk", chunk))
                     except Exception as e:
                         loop.call_soon_threadsafe(chunk_queue.put_nowait, ("error", str(e)))
                     finally:
@@ -205,16 +222,22 @@ async def chat_stream(req: ChatRequest):
 
                 reader_future = pool.submit(_reader)
 
+                gen_stats = None
                 while True:
                     kind, data = await chunk_queue.get()
                     if kind == "chunk":
                         full_text += data
                         yield {"data": json.dumps({"type": "chunk", "text": data})}
+                    elif kind == "stats":
+                        gen_stats = data
                     elif kind == "error":
                         yield {"data": json.dumps({"type": "error", "message": data})}
                         break
                     else:
                         break
+
+                if gen_stats:
+                    yield {"data": json.dumps({"type": "stats", **gen_stats})}
 
         except Exception as e:
             yield {"data": json.dumps({"type": "error", "message": str(e)})}
