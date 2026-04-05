@@ -54,9 +54,9 @@ async def local_models():
 
 
 @app.get("/api/models/search")
-async def search_models(q: str = "", limit: int = 30):
+async def search_models(q: str = "", sort: str = "downloads", limit: int = 30):
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(_thread_pool, lambda: mm.search_models(q, limit))
+    return await loop.run_in_executor(_thread_pool, lambda: mm.search_models(q, sort, limit))
 
 
 class DownloadRequest(BaseModel):
@@ -75,6 +75,14 @@ def download_status(model_id: str):
     if status is None:
         return {"progress": 0.0, "done": False, "error": None, "current_file": ""}
     return status
+
+
+@app.get("/api/models/size")
+async def model_size(model_id: str):
+    """Fetch exact model size from HF usedStorage (cached)."""
+    loop = asyncio.get_event_loop()
+    size = await loop.run_in_executor(_thread_pool, lambda: mm.fetch_model_size(model_id))
+    return {"model_id": model_id, "size_gb": size}
 
 
 @app.delete("/api/models/{model_id:path}")

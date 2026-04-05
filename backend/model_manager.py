@@ -3,53 +3,213 @@ HuggingFace model management: list local, search, download, delete.
 All models are from the mlx-community organization.
 """
 import os
+import re
 import shutil
 import threading
+import time
 from pathlib import Path
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any, Dict, List, Optional
 
 import psutil
 
 MLX_ORG = "mlx-community"
+_GiB = 1024 ** 3  # bytes → gibibytes (matches Apple's "GB" labelling)
+_HF_API  = "https://huggingface.co/api/models"
 
-# Progress tracking for active downloads: model_id → {"progress": 0.0, "done": False, "error": None}
+# Progress tracking for active downloads
 _download_status: Dict[str, Dict] = {}
 _download_lock = threading.Lock()
 
+# Small LRU-style cache for individual model sizes (usedStorage)
+_size_cache: Dict[str, Optional[float]] = {}
+_SIZE_CACHE_MAX = 500
 
-# ── Memory helpers ──────────────────────────────────────────────────────────
+# ── Publisher detection ──────────────────────────────────────────────────────
+
+# Map HF organization slugs → display names
+_ORG_DISPLAY: Dict[str, str] = {
+    "google":          "Google",
+    "meta-llama":      "Meta",
+    "qwen":            "Alibaba",
+    "alibaba":         "Alibaba",
+    "qwen-vl":         "Alibaba",
+    "microsoft":       "Microsoft",
+    "mistralai":       "Mistral AI",
+    "deepseek-ai":     "DeepSeek",
+    "tiiuae":          "TII",
+    "cohere":          "Cohere",
+    "cohere-ai":       "Cohere",
+    "01-ai":           "01.AI",
+    "upstage":         "Upstage",
+    "bigcode":         "BigCode",
+    "apple":           "Apple",
+    "allenai":         "Allen AI",
+    "stabilityai":     "Stability AI",
+    "bigscience":      "BigScience",
+    "lmsys":           "LMSYS",
+    "nousresearch":    "NousResearch",
+    "huggingface":     "HuggingFace",
+    "huggingfaceh4":   "HuggingFace",
+    "opengvlab":       "OpenGVLab",
+    "moonshotai":      "Moonshot AI",
+    "anthropic":       "Anthropic",
+    "openai":          "OpenAI",
+    "llava-hf":        "LLaVA",
+    "vikhyatk":        "Moondream",
+    "internlm":        "Shanghai AI Lab",
+    "baichuan-inc":    "Baichuan",
+    "01ai":            "01.AI",
+    "thudm":           "Tsinghua",
+    "cognitivecomputations": "Cognitive Comp.",
+    "teknium":         "NousResearch",
+}
+
+# Fallback: keyword scan of model name
+_NAME_PUBLISHERS = [
+    (["gemma"],          "Google"),
+    (["llama", "codellama"], "Meta"),
+    (["qwen"],           "Alibaba"),
+    (["mistral", "mixtral", "pixtral", "devstral"], "Mistral AI"),
+    (["phi-"],           "Microsoft"),
+    (["deepseek"],       "DeepSeek"),
+    (["falcon"],         "TII"),
+    (["command-r"],      "Cohere"),
+    (["solar"],          "Upstage"),
+    (["starcoder"],      "BigCode"),
+    (["openelm"],        "Apple"),
+    (["smollm"],         "HuggingFace"),
+    (["olmo"],           "Allen AI"),
+    (["stablelm"],       "Stability AI"),
+    (["hermes"],         "NousResearch"),
+    (["dolphin"],        "Cognitive Comp."),
+    (["zephyr"],         "HuggingFace"),
+    (["wizard"],         "Microsoft"),
+    (["kimi"],           "Moonshot AI"),
+    (["internvl"],       "OpenGVLab"),
+    (["llava"],          "LLaVA"),
+    (["moondream"],      "Moondream"),
+    (["yi-"],            "01.AI"),
+]
+
+
+def _publisher_from_base_models(base_models: Any) -> Optional[str]:
+    """Extract publisher from the HF baseModels expand field."""
+    if not base_models:
+        return None
+    try:
+        models_list = base_models.get("models") or []
+        if not models_list:
+            return None
+        base_id = models_list[0].get("id", "")
+        org = base_id.split("/")[0].lower() if "/" in base_id else ""
+        return _ORG_DISPLAY.get(org)
+    except Exception:
+        return None
+
+
+def _publisher_from_name(name: str) -> Optional[str]:
+    """Fallback: detect publisher from model name keywords."""
+    name_lower = name.lower()
+    for keywords, pub in _NAME_PUBLISHERS:
+        if any(kw in name_lower for kw in keywords):
+            return pub
+    return None
+
+
+# ── Size estimation ───────────────────────────────────────────────────────────
+
+def _estimate_size_gb(name: str) -> Optional[float]:
+    """
+    Estimate disk size in GB from model name.
+    Uses active param count (a<N>b) for MoE models when available,
+    otherwise total param count.
+    Returns None if parameters cannot be parsed.
+    """
+    n = name.lower()
+
+    # Active param count takes precedence for MoE  (e.g. "a4b" in "26b-a4b")
+    active = re.search(r'[\-_]a(\d+(?:\.\d+)?)b', n)
+    if active:
+        params_b = float(active.group(1))
+    else:
+        pm = re.search(r'(\d+(?:\.\d+)?)b(?:[\-_ ]|$|it|instruct|chat|preview|turbo|coder)', n)
+        if not pm:
+            return None
+        params_b = float(pm.group(1))
+
+    # Quantisation bits
+    bm = re.search(r'(\d+)[\-_]?bit', n)
+    if bm:
+        bits = int(bm.group(1))
+    elif any(x in n for x in ("f16", "fp16", "bf16", "half")):
+        bits = 16
+    else:
+        bits = 4  # mlx-community default
+
+    size_gb = params_b * (bits / 8) * 1.15  # 15% overhead for tokeniser / configs
+    return round(size_gb, 1)
+
+
+# ── Size cache + lazy fetch ───────────────────────────────────────────────────
+
+def fetch_model_size(model_id: str) -> Optional[float]:
+    """Fetch exact model size (GB) via the HF individual model endpoint."""
+    if model_id in _size_cache:
+        return _size_cache[model_id]
+
+    import requests
+    size = None
+    try:
+        resp = requests.get(
+            f"{_HF_API}/{model_id}",
+            params={"expand[]": "usedStorage"},
+            timeout=8,
+            headers={"User-Agent": "mlx-chat/1.0"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        used = data.get("usedStorage")
+        if used and used > 0:
+            size = round(used / _GiB, 2)
+    except Exception:
+        pass
+
+    if len(_size_cache) >= _SIZE_CACHE_MAX:
+        del _size_cache[next(iter(_size_cache))]
+    _size_cache[model_id] = size
+    return size
+
+
+# ── Memory helpers ───────────────────────────────────────────────────────────
 
 def get_system_memory() -> Dict[str, float]:
     vm = psutil.virtual_memory()
     return {
-        "total_gb": vm.total / 1e9,
-        "available_gb": vm.available / 1e9,
-        "used_gb": vm.used / 1e9,
-        "percent": vm.percent,
+        "total_gb":     vm.total / _GiB,
+        "available_gb": vm.available / _GiB,
+        "used_gb":      vm.used / _GiB,
+        "percent":      vm.percent,
     }
 
 
-def _gpu_label(model_size_gb: Optional[float]) -> str:
-    if model_size_gb is None:
+def _gpu_label(size_gb: Optional[float]) -> str:
+    if size_gb is None:
         return "unknown"
     mem = get_system_memory()
-    available = mem["available_gb"]
-    total = mem["total_gb"]
-    if model_size_gb < available * 0.85:
+    if size_gb < mem["available_gb"] * 0.85:
         return "full"
-    if model_size_gb < total:
+    if size_gb < mem["total_gb"]:
         return "partial"
     return "too_large"
 
 
-# ── Local model helpers ──────────────────────────────────────────────────────
+# ── Local model helpers ───────────────────────────────────────────────────────
 
 def _hf_cache_root() -> Path:
     return Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
 
 
 def list_local_models() -> List[Dict[str, Any]]:
-    """Return mlx-community models already in the HF cache."""
     from huggingface_hub import scan_cache_dir
     try:
         cache = scan_cache_dir()
@@ -60,30 +220,28 @@ def list_local_models() -> List[Dict[str, Any]]:
     for repo in cache.repos:
         if not repo.repo_id.startswith(f"{MLX_ORG}/"):
             continue
-        size_gb = repo.size_on_disk / 1e9
+        size_gb = repo.size_on_disk / _GiB
         results.append({
-            "id": repo.repo_id,
-            "name": repo.repo_id.split("/", 1)[-1],
-            "size_gb": round(size_gb, 2),
+            "id":        repo.repo_id,
+            "name":      repo.repo_id.split("/", 1)[-1],
+            "size_gb":   round(size_gb, 2),
             "gpu_label": _gpu_label(size_gb),
         })
     return results
 
 
 def delete_local_model(model_id: str) -> bool:
-    """Remove a model from the HF cache. Returns True if removed."""
     from huggingface_hub import scan_cache_dir
     try:
         cache = scan_cache_dir()
         for repo in cache.repos:
             if repo.repo_id == model_id:
-                delete_strategy = cache.delete_revisions(*[r.commit_hash for r in repo.revisions])
-                delete_strategy.execute()
+                strategy = cache.delete_revisions(*[r.commit_hash for r in repo.revisions])
+                strategy.execute()
                 return True
     except Exception:
         pass
 
-    # Fallback: manual directory removal
     safe = model_id.replace("/", "--")
     path = _hf_cache_root() / f"models--{safe}"
     if path.exists():
@@ -92,56 +250,118 @@ def delete_local_model(model_id: str) -> bool:
     return False
 
 
-# ── HuggingFace search ───────────────────────────────────────────────────────
+# ── HuggingFace search ────────────────────────────────────────────────────────
 
-def _model_size_from_info(info) -> Optional[float]:
-    """Estimate model size in GB from HF ModelInfo."""
+SORT_OPTIONS = {
+    "downloads": "downloads",
+    "likes":     "likes",
+    "recent":    "lastModified",
+    "trending":  "trendingScore",
+}
+
+
+def search_models(query: str = "", sort: str = "downloads", limit: int = 30) -> List[Dict[str, Any]]:
+    import requests
+
+    hf_sort = SORT_OPTIONS.get(sort, "downloads")
+    params = [
+        ("author",    MLX_ORG),
+        ("sort",      hf_sort),
+        ("direction", -1),
+        ("limit",     limit),
+        ("expand[]",  "baseModels"),
+        ("expand[]",  "lastModified"),
+    ]
+    if query:
+        params.append(("search", query))
+
     try:
-        total = sum(s.size for s in info.siblings if s.size is not None)
-        if total:
-            return round(total / 1e9, 2)
+        resp = requests.get(
+            _HF_API, params=params, timeout=15,
+            headers={"User-Agent": "mlx-chat/1.0"},
+        )
+        resp.raise_for_status()
+        raw = resp.json()
+        if not isinstance(raw, list):
+            return []
     except Exception:
-        pass
-    return None
-
-
-def search_models(query: str = "", limit: int = 30) -> List[Dict[str, Any]]:
-    from huggingface_hub import list_models
-    try:
-        kwargs = dict(author=MLX_ORG, sort="downloads", direction=-1, limit=limit, full=True)
-        if query:
-            kwargs["search"] = query
-        models = list(list_models(**kwargs))
-    except Exception as e:
         return []
 
-    mem = get_system_memory()
     results = []
-    for m in models:
-        size_gb = _model_size_from_info(m)
+    for m in raw:
+        model_id = m.get("id") or m.get("modelId", "")
+        if not model_id:
+            continue
+
+        name = model_id.split("/", 1)[-1]
+
+        # Size: estimate from name (actual size fetched lazily per card)
+        est_size = _estimate_size_gb(name)
+
+        # Publisher: from base_models expand, fallback to name keywords
+        publisher = (
+            _publisher_from_base_models(m.get("baseModels"))
+            or _publisher_from_name(name)
+        )
+
         results.append({
-            "id": m.modelId,
-            "name": m.modelId.split("/", 1)[-1],
-            "downloads": getattr(m, "downloads", 0) or 0,
-            "size_gb": size_gb,
-            "gpu_label": _gpu_label(size_gb),
-            "tags": list(getattr(m, "tags", []) or [])[:8],
+            "id":            model_id,
+            "name":          name,
+            "downloads":     m.get("downloads") or 0,
+            "likes":         m.get("likes") or 0,
+            "last_modified": m.get("lastModified", ""),
+            "est_size_gb":   est_size,        # estimated, shown with ~
+            "size_gb":       None,            # real size fetched lazily
+            "gpu_label":     _gpu_label(est_size),
+            "publisher":     publisher,
+            "tags":          (m.get("tags") or [])[:8],
         })
     return results
 
 
-# ── Download ─────────────────────────────────────────────────────────────────
+# ── Download ──────────────────────────────────────────────────────────────────
+
+_DOWNLOAD_TIMEOUT_S = 1800  # 30 minutes max per download
+_STALL_TIMEOUT_S    = 300   # 5 minutes without progress = stalled
+
 
 def get_download_status(model_id: str) -> Optional[Dict]:
-    return _download_status.get(model_id)
+    status = _download_status.get(model_id)
+    if status is None:
+        return None
+
+    # Detect stall / global timeout on every poll
+    if not status["done"]:
+        now = time.time()
+        elapsed = now - status["start_time"]
+        stalled = now - status["last_update"] > _STALL_TIMEOUT_S
+
+        if elapsed > _DOWNLOAD_TIMEOUT_S:
+            with _download_lock:
+                _download_status[model_id]["done"]  = True
+                _download_status[model_id]["error"] = "Download timed out after 30 minutes."
+        elif stalled:
+            with _download_lock:
+                _download_status[model_id]["done"]  = True
+                _download_status[model_id]["error"] = "Download stalled (no progress for 5 minutes)."
+
+    return dict(_download_status[model_id])
 
 
 def start_download(model_id: str) -> None:
-    """Begin downloading a model in a background thread."""
     with _download_lock:
-        if model_id in _download_status and not _download_status[model_id].get("done"):
-            return  # Already in progress
-        _download_status[model_id] = {"progress": 0.0, "done": False, "error": None, "current_file": ""}
+        existing = _download_status.get(model_id)
+        if existing and not existing.get("done"):
+            return  # already in progress
+        now = time.time()
+        _download_status[model_id] = {
+            "progress":    0.0,
+            "done":        False,
+            "error":       None,
+            "current_file": "",
+            "start_time":  now,
+            "last_update": now,
+        }
 
     t = threading.Thread(target=_download_worker, args=(model_id,), daemon=True)
     t.start()
@@ -153,20 +373,26 @@ def _download_worker(model_id: str) -> None:
 
         info = model_info(model_id)
         siblings = [s for s in info.siblings if s.rfilename]
-        total = len(siblings)
+        total = max(len(siblings), 1)
 
         for i, sibling in enumerate(siblings):
             with _download_lock:
+                if _download_status[model_id].get("done"):
+                    return  # cancelled / timed out
                 _download_status[model_id]["current_file"] = sibling.rfilename
-                _download_status[model_id]["progress"] = i / max(total, 1)
+                _download_status[model_id]["progress"]     = i / total
+                _download_status[model_id]["last_update"]  = time.time()
 
             hf_hub_download(repo_id=model_id, filename=sibling.rfilename)
 
         with _download_lock:
-            _download_status[model_id]["progress"] = 1.0
-            _download_status[model_id]["done"] = True
+            _download_status[model_id]["progress"]    = 1.0
+            _download_status[model_id]["done"]        = True
+            _download_status[model_id]["last_update"] = time.time()
 
     except Exception as e:
         with _download_lock:
-            _download_status[model_id]["error"] = str(e)
-            _download_status[model_id]["done"] = True
+            if model_id in _download_status:
+                _download_status[model_id]["error"]       = str(e)
+                _download_status[model_id]["done"]        = True
+                _download_status[model_id]["last_update"] = time.time()
