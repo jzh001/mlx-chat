@@ -667,6 +667,33 @@ function stripControlTokens(text) {
     .trim();
 }
 
+function extractAssistantHistoryText(rawText) {
+  const parsed = splitReasoningAndFinal(String(rawText || ""), { streaming: false });
+  const finalOnly = stripControlTokens(parsed.finalText || "");
+  if (finalOnly) return finalOnly;
+  return stripControlTokens(rawText || "");
+}
+
+function sanitizeMessageForApi(message) {
+  const msg = { ...(message || {}) };
+  const role = String(msg.role || "").toLowerCase();
+  const content = String(msg.content || "");
+
+  if (role === "assistant") {
+    msg.content = extractAssistantHistoryText(content);
+  } else {
+    msg.content = stripControlTokens(content);
+  }
+
+  return msg;
+}
+
+function sanitizeMessagesForApi(list) {
+  return (Array.isArray(list) ? list : [])
+    .map(sanitizeMessageForApi)
+    .filter((m) => m.role !== "assistant" || Boolean(String(m.content || "").trim()));
+}
+
 function unwrapJsonCodeFence(text) {
   const source = String(text || "").trim();
   const m = source.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
@@ -1229,7 +1256,7 @@ async function sendMessage() {
         body: JSON.stringify({
           conversation_id: null,
           model_id: state.currentModelId,
-          messages: nextMessages,
+          messages: sanitizeMessagesForApi(nextMessages),
         }),
       });
       state.currentConvId = draft.conversation_id;
@@ -1271,7 +1298,7 @@ async function sendMessage() {
         conversation_id: state.currentConvId,
         request_id: currentRequestId,
         model_id: state.currentModelId,
-        messages: [...messages],
+        messages: sanitizeMessagesForApi(messages),
         settings,
       }),
       signal: currentStreamController.signal,
@@ -1451,7 +1478,7 @@ async function loadConversation(convId) {
 
     const conv = await api(`/api/conversations/${convId}`);
     state.currentConvId = convId;
-    messages = conv.messages || [];
+    messages = Array.isArray(conv.messages) ? conv.messages : [];
 
     const container = messagesEl();
     container.innerHTML = "";
