@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import logging
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +29,7 @@ from . import mlx_handler as mlx
 from . import model_manager as mm
 
 FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+logger = logging.getLogger("mlx_chat.server")
 
 app = FastAPI(title="MLX Chat")
 
@@ -150,6 +152,7 @@ def get_last_model():
 async def load_model(req: LoadRequest):
     loop = asyncio.get_event_loop()
     try:
+        logger.info("Loading model requested: %s", req.model_id)
         caps = await loop.run_in_executor(_thread_pool, lambda: mm.get_model_capabilities(req.model_id))
         if not caps.get("loadable", True):
             raise HTTPException(status_code=400, detail=caps.get("reason") or "Model is not supported in this app.")
@@ -157,8 +160,12 @@ async def load_model(req: LoadRequest):
         backend = "vlm" if caps.get("vision") else "lm"
         await loop.run_in_executor(_thread_pool, lambda: mlx.load_model(req.model_id, backend=backend))
         cfg.set_last_model(req.model_id)
+        logger.info("Model loaded successfully: %s (%s)", req.model_id, backend)
         return {"status": "loaded", "model_id": req.model_id}
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.exception("Model load failed for %s", req.model_id)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -172,6 +179,7 @@ def loaded_model():
 
 @app.post("/api/model/unload")
 def unload_model():
+    logger.info("Model unload requested")
     mlx.unload_model()
     return {"status": "unloaded"}
 

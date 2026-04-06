@@ -2,6 +2,7 @@
 Wrapper around mlx_vlm for model loading and streaming generation.
 Keeps one model in memory at a time.
 """
+import logging
 import threading
 import gc
 from typing import Generator, List, Dict, Any, Optional
@@ -15,6 +16,7 @@ _processor = None
 _config = None
 _backend_type: Optional[str] = None  # "vlm" | "lm"
 _load_status: Dict[str, Any] = {"state": "idle", "message": ""}
+logger = logging.getLogger("mlx_chat.mlx_handler")
 
 
 def _release_runtime_memory() -> None:
@@ -94,25 +96,50 @@ def load_model(model_id: str, backend: Optional[str] = None) -> None:
 
         try:
             selected_backend = backend or "vlm"
+            logger.info("Beginning model load: model_id=%s backend=%s", model_id, selected_backend)
 
             if selected_backend == "lm":
+                logger.info("Importing mlx_lm.load for %s", model_id)
                 from mlx_lm import load as lm_load
 
+                logger.info("Calling mlx_lm.load for %s", model_id)
                 model, tokenizer = lm_load(model_id)
+                logger.info("mlx_lm.load completed for %s", model_id)
                 _model = model
                 _processor = tokenizer
                 _config = None
                 _backend_type = "lm"
             else:
-                from mlx_vlm import load as vlm_load
-                from mlx_vlm.utils import load_config
+                logger.info("Importing mlx_vlm.load for %s", model_id)
+                try:
+                    from mlx_vlm import load as vlm_load
+                    logger.info("Importing mlx_vlm.utils.load_config for %s", model_id)
+                    from mlx_vlm.utils import load_config
 
-                model, processor = vlm_load(model_id)
-                config = load_config(model_id)
-                _model = model
-                _processor = processor
-                _config = config
-                _backend_type = "vlm"
+                    logger.info("Calling mlx_vlm.load for %s", model_id)
+                    model, processor = vlm_load(model_id)
+                    logger.info("mlx_vlm.load completed for %s", model_id)
+                    logger.info("Calling mlx_vlm.utils.load_config for %s", model_id)
+                    config = load_config(model_id)
+                    logger.info("load_config completed for %s", model_id)
+                    _model = model
+                    _processor = processor
+                    _config = config
+                    _backend_type = "vlm"
+                except Exception as vlm_err:
+                    logger.warning(
+                        "mlx_vlm failed to load %s (%s); retrying with mlx_lm",
+                        model_id, vlm_err,
+                    )
+                    _release_runtime_memory()
+                    from mlx_lm import load as lm_load
+                    logger.info("Calling mlx_lm.load (fallback) for %s", model_id)
+                    model, tokenizer = lm_load(model_id)
+                    logger.info("mlx_lm.load (fallback) completed for %s", model_id)
+                    _model = model
+                    _processor = tokenizer
+                    _config = None
+                    _backend_type = "lm"
 
             _current_model_id = model_id
             _load_status = {
@@ -121,6 +148,7 @@ def load_model(model_id: str, backend: Optional[str] = None) -> None:
                 "backend": _backend_type,
             }
         except Exception as e:
+            logger.exception("Model load raised an exception for %s", model_id)
             _load_status = {"state": "error", "message": str(e)}
             raise
 

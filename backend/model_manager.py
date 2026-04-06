@@ -164,15 +164,13 @@ def _estimate_size_gb(name: str) -> Optional[float]:
     """
     n = name.lower()
 
-    # Active param count takes precedence for MoE  (e.g. "a4b" in "26b-a4b")
-    active = re.search(r'[\-_]a(\d+(?:\.\d+)?)b', n)
-    if active:
-        params_b = float(active.group(1))
-    else:
-        pm = re.search(r'(\d+(?:\.\d+)?)b(?:[\-_ ]|$|it|instruct|chat|preview|turbo|coder)', n)
-        if not pm:
-            return None
-        params_b = float(pm.group(1))
+    # For MoE models (e.g. "26b-a4b"), ALL expert weights are loaded into memory
+    # at inference time — only the active subset is *used* per token.  Use the
+    # total param count for the size estimate so we don't wildly underestimate.
+    pm = re.search(r'(\d+(?:\.\d+)?)b(?:[\-_ ]|$|it|instruct|chat|preview|turbo|coder)', n)
+    if not pm:
+        return None
+    params_b = float(pm.group(1))
 
     # Quantisation bits
     bm = re.search(r'(\d+)[\-_]?bit', n)

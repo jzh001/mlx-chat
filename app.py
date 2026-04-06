@@ -3,12 +3,80 @@
 MLX Chat – entry point.
 Starts a local FastAPI server then opens a native macOS window via PyWebView.
 """
+import fcntl
+import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import threading
 import time
 import socket
 
 import uvicorn
+
+from backend import config as cfg
+
+
+def _configure_logging() -> None:
+    log_file = cfg.LOG_FILE
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
+    root = logging.getLogger()
+    if root.handlers:
+        return
+
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=1_000_000,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+
+    stream_handler = logging.StreamHandler(sys.stderr)
+    stream_handler.setFormatter(formatter)
+
+    root.setLevel(logging.INFO)
+    root.addHandler(file_handler)
+    root.addHandler(stream_handler)
+
+    def _log_unhandled_exception(exc_type, exc_value, exc_traceback):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        logging.getLogger("mlx_chat").exception(
+            "Unhandled exception",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+
+    def _log_thread_exception(args):
+        logging.getLogger("mlx_chat").exception(
+            "Unhandled thread exception",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _log_unhandled_exception
+    threading.excepthook = _log_thread_exception
+
+
+_instance_lock_fh = None
+
+
+def _acquire_instance_lock() -> bool:
+    """Try to acquire an exclusive process lock. Returns False if another instance is running."""
+    global _instance_lock_fh
+    lock_path = cfg.APP_DIR / "app.lock"
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return False
+    # Keep the file handle open — closing it releases the lock.
+    _instance_lock_fh = fh
+    return True
 
 
 def _find_free_port() -> int:
@@ -68,11 +136,21 @@ def _wait_for_server(timeout: float = 30.0) -> bool:
 
 
 def main():
+    _configure_logging()
+    logger = logging.getLogger("mlx_chat")
+
+    if not _acquire_instance_lock():
+        logger.warning("Another instance of MLX Chat is already running — exiting.")
+        sys.exit(0)
+
+    logger.info("Starting MLX Chat")
+
     # Run the server in a daemon thread so UI close is never blocked on teardown.
     server_thread = threading.Thread(target=_start_server, daemon=True)
     server_thread.start()
 
     if not _wait_for_server():
+        logger.error("Server failed to start")
         print("ERROR: Server failed to start.", file=sys.stderr)
         sys.exit(1)
 
@@ -94,6 +172,7 @@ def main():
     except ImportError:
         # Fallback: open in system browser if PyWebView not installed
         import webbrowser
+        logger.warning("PyWebView not available, falling back to browser mode")
         print(f"PyWebView not found. Opening in browser at {SERVER_URL}")
         webbrowser.open(SERVER_URL)
         # Keep server alive
@@ -101,7 +180,11 @@ def main():
             server_thread.join()
         except KeyboardInterrupt:
             pass
+    except Exception:
+        logger.exception("App failed while launching webview")
+        raise
     finally:
+        logger.info("Stopping MLX Chat")
         _stop_server(timeout=0.15)
 
 

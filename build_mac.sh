@@ -9,20 +9,24 @@ echo "Installing build dependencies..."
 pip install pyinstaller 2>/dev/null || true
 
 echo "Building $APP_NAME..."
-pyinstaller \
-  --name "$APP_NAME" \
-  --windowed \
-  --noconfirm \
-  --add-data "frontend:frontend" \
-  --hidden-import "uvicorn.logging" \
-  --hidden-import "uvicorn.loops.auto" \
-  --hidden-import "uvicorn.protocols.http.auto" \
-  --hidden-import "uvicorn.lifespan.on" \
-  --hidden-import "sse_starlette" \
-  --hidden-import "mlx_vlm" \
-  --hidden-import "mlx_vlm.prompt_utils" \
-  --hidden-import "mlx_vlm.utils" \
+pyinstaller_args=(
+  --name "$APP_NAME"
+  --windowed
+  --clean
+  --noconfirm
+  --add-data "frontend:frontend"
+  --hidden-import "uvicorn.logging"
+  --hidden-import "uvicorn.loops.auto"
+  --hidden-import "uvicorn.protocols.http.auto"
+  --hidden-import "uvicorn.lifespan.on"
+  --hidden-import "sse_starlette"
+  --collect-all "mlx"
+  --collect-all "mlx_lm"
+  --collect-all "mlx_vlm"
   "$ENTRY"
+)
+
+pyinstaller "${pyinstaller_args[@]}"
 
 echo ""
 echo "Done! App is at: dist/$APP_NAME.app"

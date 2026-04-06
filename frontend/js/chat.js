@@ -28,241 +28,313 @@ function escapeHtml(text) {
     .replace(/'/g, "&#39;");
 }
 
-function normalizeMathText(text) {
-  let out = String(text || "");
-
-  const unwrapEscapedLatex = (expr) => (
-    String(expr || "")
-      // Models often double-escape LaTeX commands in streamed/plain-text output.
-      .replace(/\\\\([A-Za-z]+)/g, "\\$1")
-      .replace(/\\\\([{}_^])/g, "\\$1")
-  );
-
-  const wrapBareLatexParens = (source) => (
-    String(source || "").replace(/\(([^()\n]*\\[A-Za-z]+[^()\n]*)\)/g, (whole, inner) => {
-      const expr = unwrapEscapedLatex(inner).trim();
-      if (!expr) return whole;
-      return `\\(${expr}\\)`;
-    })
-  );
-
-  const repairLatexMatrices = (expr) => {
-    const src = String(expr || "");
-
-    return src.replace(
-      /\\begin\{((?:b|p|v|V|B|small)?matrix)\}([\s\S]*?)\\end\{\1\}/g,
-      (whole, envName, inner) => {
-        const prepared = String(inner || "")
-          // Common model shorthand uses | or ; to separate rows.
-          .replace(/\\\\/g, "\n")
-          .replace(/\s*[|;]\s*/g, "\n");
-
-        const lines = prepared
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter((line) => line.length > 0);
-
-        if (lines.length < 2) {
-          return whole;
-        }
-
-        // Normalize row endings. Many model outputs use a single trailing
-        // backslash per row, which is invalid in LaTeX matrices.
-        const normalizedLines = lines.map((line, idx) => {
-          const row = line.replace(/(?:\\\\|\\)\s*$/, "").trim();
-          return idx < lines.length - 1 ? `${row} \\\\` : row;
-        });
-
-        return `\\begin{${envName}}\n${normalizedLines.join("\n")}\n\\end{${envName}}`;
-      },
-    );
-  };
-
-  // Some models emit display math as a standalone [ ... ] block.
-  // Normalize that to $$...$$ so KaTeX reliably renders it.
-  out = out.replace(/(^|\n)\s*\[\s*\n([\s\S]*?)\n\s*\](?=\n|$)/g, (m, lead, body) => {
-    return `${lead}$$\n${body}\n$$`;
-  });
-
-  // Normalize common doubly-escaped math delimiters from JSON/plain-text output.
-  out = out
-    .replace(/\\\$/g, "$")
-    .replace(/\\\\\(/g, "\\(")
-    .replace(/\\\\\)/g, "\\)")
-    .replace(/\\\\\[/g, "\\[")
-    .replace(/\\\\\]/g, "\\]");
-
-  // Promote plain parenthesized LaTeX fragments like (\Sigma) or (m \times n)
-  // into actual inline math so KaTeX can render them.
-  out = wrapBareLatexParens(out);
-
-  // Convert compact numeric matrix shorthand to KaTeX matrix syntax.
-  // Examples:
-  //   (1 2 3 4)        -> \begin{bmatrix}1 & 2 \\ 3 & 4\end{bmatrix}
-  //   (1 2; 3 4)       -> \begin{bmatrix}1 & 2 \\ 3 & 4\end{bmatrix}
-  // This runs only inside math delimiters to avoid changing plain text prose.
-  const toMatrixLatex = (expr) => {
-    const isNum = (s) => /^[-+]?\d*\.?\d+(?:e[-+]?\d+)?$/i.test(s);
-
-    const matrixFromBody = (whole, body) => {
-      const src = String(body || "").trim();
-      if (!src) return whole;
-      if (/\\begin\s*\{(?:b|p|v|V|B|small)?matrix\}/i.test(src)) return whole;
-
-      let rows = [];
-      const splitByRows = /[;|]/.test(src)
-        ? src.split(/[;|]/)
-        : (src.includes("\n") ? src.split(/\n+/) : [src]);
-
-      for (const row of splitByRows) {
-        const tokens = row.trim().split(/[\s,]+/).filter(Boolean);
-        if (!tokens.length || !tokens.every(isNum)) {
-          return whole;
-        }
-        rows.push(tokens);
-      }
-
-      if (rows.length === 1) {
-        const tokens = rows[0];
-        if (tokens.length < 4) return whole;
-
-        const side = Math.sqrt(tokens.length);
-        if (Number.isInteger(side)) {
-          rows = [];
-          for (let i = 0; i < tokens.length; i += side) {
-            rows.push(tokens.slice(i, i + side));
-          }
-        } else if (tokens.length % 2 === 0) {
-          // Prefer two rows for flat even-length numeric lists like [7 0 0 2.1 0 0].
-          const width = tokens.length / 2;
-          rows = [tokens.slice(0, width), tokens.slice(width)];
-        } else {
-          return whole;
-        }
-      }
-
-      const width = rows[0].length;
-      if (!width || !rows.every((r) => r.length === width)) return whole;
-
-      const matrixBody = rows.map((r) => r.join(" & ")).join(" \\\\ ");
-      return `\\begin{bmatrix}${matrixBody}\\end{bmatrix}`;
-    };
-
-    let outExpr = String(expr || "").replace(/\(([^()]+)\)/g, matrixFromBody);
-    outExpr = outExpr.replace(/\[([^\[\]]+)\]/g, matrixFromBody);
-    return outExpr;
-  };
-
-  const normalizeMathExpr = (expr) => {
-    const unescaped = unwrapEscapedLatex(expr);
-    return repairLatexMatrices(toMatrixLatex(unescaped));
-  };
-
-  out = out.replace(/\$\$([\s\S]*?)\$\$/g, (m, expr) => `$$${normalizeMathExpr(expr)}$$`);
-  out = out.replace(/\\\[([\s\S]*?)\\\]/g, (m, expr) => `\\[${normalizeMathExpr(expr)}\\]`);
-  out = out.replace(/\\\(([\s\S]*?)\\\)/g, (m, expr) => `\\(${normalizeMathExpr(expr)}\\)`);
-
-  return out;
+function isAsciiLetter(ch) {
+  if (!ch) return false;
+  const code = ch.charCodeAt(0);
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
 }
 
-function normalizeInlineDollarMath(text) {
+function isWhitespace(ch) {
+  return ch === " " || ch === "\t" || ch === "\n" || ch === "\r";
+}
+
+function startsWithAt(text, index, token) {
+  return String(text || "").slice(index, index + token.length) === token;
+}
+
+function collapseEscapedLatex(text) {
   const source = String(text || "");
+  const special = "{}_^()[]$";
   let out = "";
   let i = 0;
 
   while (i < source.length) {
-    const ch = source[i];
-    if (ch !== "$") {
-      out += ch;
+    if (source[i] !== "\\") {
+      out += source[i];
       i += 1;
       continue;
     }
 
-    // Leave display math intact for the dedicated block handler.
-    if (source[i + 1] === "$") {
-      out += "$$";
-      i += 2;
+    let j = i;
+    while (j < source.length && source[j] === "\\") j += 1;
+    const slashCount = j - i;
+    const next = source[j] || "";
+    const looksLikeLatex = isAsciiLetter(next) || special.includes(next);
+
+    if (looksLikeLatex && slashCount > 1) {
+      out += "\\";
+      i = j;
       continue;
     }
 
-    let j = i + 1;
-    let found = -1;
-    while (j < source.length) {
-      if (source[j] === "$" && source[j - 1] !== "\\") {
-        found = j;
-        break;
-      }
-      if (source[j] === "\n") {
-        break;
-      }
-      j += 1;
-    }
-
-    if (found === -1) {
-      out += ch;
-      i += 1;
-      continue;
-    }
-
-    const expr = source.slice(i + 1, found).trim();
-    if (!expr) {
-      out += "$$";
-      i = found + 1;
-      continue;
-    }
-
-    out += `\\(${expr}\\)`;
-    i = found + 1;
+    out += source[i];
+    i += 1;
   }
 
   return out;
 }
 
-function stashMathSegments(text) {
-  let out = String(text || "");
+function repairMalformedMathDelimiters(text) {
+  const source = String(text || "");
+  const lines = source.split("\n");
+  const fixedLines = [];
+
+  for (const line of lines) {
+    let fixed = "";
+    const stack = [];
+
+    for (let i = 0; i < line.length; i += 1) {
+      const ch = line[i];
+      const prev = i > 0 ? line[i - 1] : "";
+      const next = i + 1 < line.length ? line[i + 1] : "";
+
+      if (ch === "\\" && (next === "(" || next === "[")) {
+        stack.push(next);
+        fixed += ch;
+        continue;
+      }
+
+      if (ch === "\\" && (next === ")" || next === "]")) {
+        if (stack.length) stack.pop();
+        fixed += ch;
+        continue;
+      }
+
+      if (prev !== "\\" && (ch === ")" || ch === "]") && stack.length) {
+        const top = stack[stack.length - 1];
+        if ((ch === ")" && top === "(") || (ch === "]" && top === "[")) {
+          stack.pop();
+          fixed += "\\";
+        }
+      }
+
+      fixed += ch;
+    }
+
+    while (stack.length) {
+      const open = stack.pop();
+      fixed += open === "(" ? "\\)" : "\\]";
+    }
+
+    fixedLines.push(fixed);
+  }
+
+  return fixedLines.join("\n");
+}
+
+function containsLatexCommand(text) {
+  const source = String(text || "");
+  for (let i = 0; i < source.length - 1; i += 1) {
+    if (source[i] === "\\" && isAsciiLetter(source[i + 1])) return true;
+  }
+  return false;
+}
+
+function countLongWordsOutsideCommands(text) {
+  const source = String(text || "");
+  let count = 0;
+  let i = 0;
+
+  while (i < source.length) {
+    if (source[i] === "\\") {
+      i += 1;
+      while (i < source.length && isAsciiLetter(source[i])) i += 1;
+      continue;
+    }
+
+    if (!isAsciiLetter(source[i])) {
+      i += 1;
+      continue;
+    }
+
+    let j = i;
+    while (j < source.length && isAsciiLetter(source[j])) j += 1;
+    if (j - i >= 3) count += 1;
+    i = j;
+  }
+
+  return count;
+}
+
+function hasEquationSignal(text) {
+  const source = String(text || "");
+  const markers = ["=", "^", "_", "\\int", "\\sum", "\\prod", "\\frac", "\\sqrt", "\\times", "\\cdot", "\\rightarrow"];
+  return markers.some((marker) => source.includes(marker));
+}
+
+function wrapLikelyMathLines(text) {
+  const lines = String(text || "").split("\n");
+  let inFence = false;
+  const out = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      inFence = !inFence;
+      out.push(line);
+      continue;
+    }
+
+    if (inFence || !trimmed) {
+      out.push(line);
+      continue;
+    }
+
+    if (trimmed.includes("$$") || trimmed.includes("\\(") || trimmed.includes("\\[") || trimmed.includes("$") ) {
+      out.push(line);
+      continue;
+    }
+
+    if (!containsLatexCommand(trimmed) || !hasEquationSignal(trimmed)) {
+      out.push(line);
+      continue;
+    }
+
+    if (countLongWordsOutsideCommands(trimmed) > 4) {
+      out.push(line);
+      continue;
+    }
+
+    const leading = line.slice(0, line.length - line.trimStart().length);
+    out.push(`${leading}$$${trimmed}$$`);
+  }
+
+  return out.join("\n");
+}
+
+function preprocessMathText(text) {
+  const collapsed = collapseEscapedLatex(text);
+  const repaired = repairMalformedMathDelimiters(collapsed);
+  return wrapLikelyMathLines(repaired);
+}
+
+function findClosing(text, fromIndex, openToken, closeToken, stopAtNewline = false) {
+  let i = fromIndex;
+  while (i < text.length) {
+    if (stopAtNewline && text[i] === "\n") return -1;
+
+    if (startsWithAt(text, i, closeToken)) {
+      if (closeToken === "$" && text[i - 1] === "\\") {
+        i += 1;
+        continue;
+      }
+      return i;
+    }
+
+    i += 1;
+  }
+  return -1;
+}
+
+function canOpenInlineDollar(text, index) {
+  const next = text[index + 1] || "";
+  if (!next || isWhitespace(next) || next === "$") return false;
+  return true;
+}
+
+function tokenizeMathSegments(text) {
+  // Tokenizer-style math extraction inspired by markdown-it/MathJax parsing flow.
+  const source = String(text || "");
   const placeholders = [];
 
   const stash = (mode, raw) => {
     const idx = placeholders.length;
-    placeholders.push({ token: `MLXCHATMATH${idx}TOKEN`, mode, raw });
-    return placeholders[idx].token;
+    const token = `MLXCHATMATH${idx}TOKEN`;
+    placeholders.push({ token, mode, raw });
+    return token;
   };
 
-  out = out.replace(/(^|\n)\s*\$\$\s*([\s\S]*?)\s*\$\$(?=\s*(?:\n|$))/g, (m, lead, expr) => {
-    const body = String(expr || "").trim();
-    if (!body) return m;
-    return `${lead}${stash("display", `$$${body}$$`)}`;
-  });
+  let out = "";
+  let i = 0;
+  let inFence = false;
+  let inInlineCode = false;
+  let lineStart = true;
 
-  out = out.replace(/(^|\n)\s*\\\[\s*([\s\S]*?)\s*\\\](?=\s*(?:\n|$))/g, (m, lead, expr) => {
-    const body = String(expr || "").trim();
-    if (!body) return m;
-    return `${lead}${stash("display", `\\[${body}\\]`)}`;
-  });
+  while (i < source.length) {
+    if (lineStart && startsWithAt(source, i, "```")) {
+      inFence = !inFence;
+      out += "```";
+      i += 3;
+      lineStart = false;
+      continue;
+    }
 
-  out = out.replace(/\\\(([\s\S]*?)\\\)/g, (m, expr) => {
-    const body = String(expr || "").trim();
-    if (!body) return m;
-    return stash("inline", `\\(${body}\\)`);
-  });
+    const ch = source[i];
+    if (!inFence && ch === "`") {
+      inInlineCode = !inInlineCode;
+      out += ch;
+      i += 1;
+      lineStart = false;
+      continue;
+    }
+
+    if (!inFence && !inInlineCode) {
+      if (startsWithAt(source, i, "$$")) {
+        const close = findClosing(source, i + 2, "$$", "$$", false);
+        if (close !== -1) {
+          out += stash("display", source.slice(i, close + 2));
+          i = close + 2;
+          lineStart = false;
+          continue;
+        }
+      }
+
+      if (startsWithAt(source, i, "\\[")) {
+        const close = findClosing(source, i + 2, "\\[", "\\]", false);
+        if (close !== -1) {
+          out += stash("display", source.slice(i, close + 2));
+          i = close + 2;
+          lineStart = false;
+          continue;
+        }
+      }
+
+      if (startsWithAt(source, i, "\\(")) {
+        const close = findClosing(source, i + 2, "\\(", "\\)", true);
+        if (close !== -1) {
+          out += stash("inline", source.slice(i, close + 2));
+          i = close + 2;
+          lineStart = false;
+          continue;
+        }
+      }
+
+      if (ch === "$" && canOpenInlineDollar(source, i)) {
+        const close = findClosing(source, i + 1, "$", "$", true);
+        if (close !== -1) {
+          const body = source.slice(i + 1, close);
+          if (body.trim()) {
+            out += stash("inline", source.slice(i, close + 1));
+            i = close + 1;
+            lineStart = false;
+            continue;
+          }
+        }
+      }
+    }
+
+    out += ch;
+    i += 1;
+    lineStart = ch === "\n";
+  }
 
   return { text: out, placeholders };
 }
 
 function restoreMathSegments(html, placeholders) {
   let out = String(html || "");
-  placeholders.forEach(({ token, mode, raw }) => {
+  for (const { token, mode, raw } of placeholders) {
     const wrapper = mode === "display"
       ? `<div class="math-display">${escapeHtml(raw)}</div>`
       : `<span class="math-inline">${escapeHtml(raw)}</span>`;
     out = out.replaceAll(token, wrapper);
-  });
+  }
   return out;
 }
 
 function renderRichText(text) {
-  const normalized = normalizeInlineDollarMath(normalizeMathText(text));
-  const { text: withPlaceholders, placeholders } = stashMathSegments(normalized);
+  const normalized = preprocessMathText(text);
+  const { text: withPlaceholders, placeholders } = tokenizeMathSegments(normalized);
   const html = renderMarkdown(withPlaceholders);
   return restoreMathSegments(html, placeholders);
 }

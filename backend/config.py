@@ -6,6 +6,7 @@ from typing import Any, Dict
 APP_DIR = Path.home() / ".mlx_chat"
 CONVERSATIONS_DIR = APP_DIR / "conversations"
 SETTINGS_DIR = APP_DIR / "settings"
+LOG_FILE = APP_DIR / "app.log"
 
 for d in [APP_DIR, CONVERSATIONS_DIR, SETTINGS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
