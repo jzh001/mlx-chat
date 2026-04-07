@@ -6,6 +6,7 @@ Starts a local FastAPI server then opens a native macOS window via PyWebView.
 import fcntl
 import logging
 from logging.handlers import RotatingFileHandler
+import os
 import sys
 import threading
 import time
@@ -89,6 +90,7 @@ PORT = _find_free_port()
 SERVER_URL = f"http://127.0.0.1:{PORT}"
 
 _uvicorn_server = None
+_shutdown_requested = threading.Event()
 
 
 def _start_server():
@@ -122,6 +124,22 @@ def _stop_server(timeout: float = 2.0):
     # Don't let slow shutdown hooks hold the UI close path.
     if getattr(_uvicorn_server, "started", False):
         _uvicorn_server.force_exit = True
+
+
+def _request_app_shutdown(reason: str = "app shutdown", force_after: float = 1.0):
+    if _shutdown_requested.is_set():
+        return
+    _shutdown_requested.set()
+
+    logger = logging.getLogger("mlx_chat")
+    logger.info("Stopping MLX Chat (%s)", reason)
+    _stop_server(timeout=0.15)
+
+    def _force_exit_if_needed():
+        time.sleep(force_after)
+        os._exit(0)
+
+    threading.Thread(target=_force_exit_if_needed, daemon=True).start()
 
 
 def _wait_for_server(timeout: float = 30.0) -> bool:
@@ -159,7 +177,7 @@ def main():
     try:
         import webview
 
-        webview.create_window(
+        window = webview.create_window(
             title="MLX Chat",
             url=SERVER_URL,
             width=1280,
@@ -167,6 +185,7 @@ def main():
             min_size=(900, 600),
             text_select=True,
         )
+        window.events.closed += lambda: _request_app_shutdown("window closed")
         webview.start(debug=("--debug" in sys.argv))
 
     except ImportError:
@@ -184,8 +203,7 @@ def main():
         logger.exception("App failed while launching webview")
         raise
     finally:
-        logger.info("Stopping MLX Chat")
-        _stop_server(timeout=0.15)
+        _request_app_shutdown("main loop finished")
 
 
 if __name__ == "__main__":
