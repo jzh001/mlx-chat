@@ -13,10 +13,10 @@
 
   <!-- highlight.js for code -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/styles/github-dark.min.css" />
-  <script src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/highlight.js@11.9.0/lib/highlight.min.js"></script>
 
   <!-- marked.js for markdown -->
-  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js"></script>
 
   <link rel="stylesheet" href="/static/css/style.css" />
 </head>
@@ -133,6 +133,30 @@
     <div class="models-header">
       <h2>Model Management</h2>
       <div id="memory-info" class="memory-info"></div>
+    </div>
+
+    <div class="models-section">
+      <h3>App Updates</h3>
+      <div id="update-card" class="update-card">
+        <div class="update-card-top">
+          <div>
+            <div class="update-card-title">MLX Chat <span id="update-current-version" class="update-version-chip">v-</span></div>
+            <div id="update-summary" class="update-summary">Checking for updates…</div>
+          </div>
+          <button id="btn-check-updates" class="btn-ghost">Check Now</button>
+        </div>
+        <div id="update-meta" class="update-meta"></div>
+        <div id="update-progress" class="update-progress hidden">
+          <div class="update-progress-bar">
+            <div id="update-progress-fill" class="update-progress-fill"></div>
+          </div>
+          <div id="update-progress-text" class="update-progress-text">Starting…</div>
+        </div>
+        <div class="update-actions">
+          <button id="btn-download-update" class="btn-primary hidden">Download Update</button>
+          <button id="btn-install-update" class="btn-primary hidden">Restart to Update</button>
+        </div>
+      </div>
     </div>
 
     <div class="models-section">

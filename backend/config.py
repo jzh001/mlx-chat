@@ -1,15 +1,40 @@
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
 APP_DIR = Path.home() / ".mlx_chat"
 CONVERSATIONS_DIR = APP_DIR / "conversations"
 SETTINGS_DIR = APP_DIR / "settings"
+UPDATES_DIR = APP_DIR / "updates"
 LOG_FILE = APP_DIR / "app.log"
+APP_NAME = "MLX Chat"
+GITHUB_REPO = "jzh001/mlx-chat"
 
-for d in [APP_DIR, CONVERSATIONS_DIR, SETTINGS_DIR]:
+for d in [APP_DIR, CONVERSATIONS_DIR, SETTINGS_DIR, UPDATES_DIR]:
     d.mkdir(parents=True, exist_ok=True)
+
+
+def resource_root() -> Path:
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+    return Path(__file__).resolve().parent.parent
+
+
+def get_app_version() -> str:
+    override = os.environ.get("MLX_CHAT_VERSION", "").strip()
+    if override:
+        return override
+
+    version_file = resource_root() / "VERSION"
+    if version_file.exists():
+        value = version_file.read_text(encoding="utf-8").strip()
+        if value:
+            return value
+    return "0.0.0-dev"
 
 DEFAULT_SETTINGS = {
     "temperature": 0.7,

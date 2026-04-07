@@ -2,6 +2,7 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +29,7 @@ _deleted_conversations: set[str] = set()
 from . import config as cfg
 from . import mlx_handler as mlx
 from . import model_manager as mm
+from . import update_manager as um
 
 def _frontend_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -97,6 +99,14 @@ def system_memory():
     return mm.get_system_memory()
 
 
+@app.get("/api/app/version")
+def app_version():
+    return {
+        "version": cfg.get_app_version(),
+        "repo": cfg.GITHUB_REPO,
+    }
+
+
 # ── Model management ─────────────────────────────────────────────────────────
 
 @app.get("/api/models/local")
@@ -151,6 +161,34 @@ async def model_size(model_id: str):
     return {"model_id": model_id, "size_gb": size}
 
 
+@app.get("/api/updates/check")
+def check_updates(force: bool = False):
+    return um.check_for_updates(force=force)
+
+
+@app.get("/api/updates/download/status")
+def update_download_status():
+    return um.get_download_status()
+
+
+@app.post("/api/updates/download")
+def start_update_download():
+    try:
+        return um.start_update_download()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/updates/install")
+def install_update():
+    try:
+        result = um.install_update_and_restart(os.getpid())
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    threading.Timer(0.35, os._exit, args=(0,)).start()
+    return result
+
+
 @app.delete("/api/models/{model_id:path}")
 def delete_model(model_id: str):
     # Prevent deleting the currently loaded model
@@ -176,7 +214,7 @@ async def load_model(req: LoadRequest):
     loop = asyncio.get_event_loop()
     try:
         logger.info("Loading model requested: %s", req.model_id)
-        caps = await loop.run_in_executor(_thread_pool, lambda: mm.get_model_capabilities(req.model_id))
+        caps = await loop.run_in_executor(_thread_pool, lambda: mm.get_model_capabilities(req.model_id, allow_network=False))
         if not caps.get("loadable", True):
             raise HTTPException(status_code=400, detail=caps.get("reason") or "Model is not supported in this app.")
 
@@ -345,7 +383,7 @@ async def chat_stream(req: ChatRequest, request: Request):
     # text-only models via crafted requests or stale client state.
     if image_data_url:
         loop = asyncio.get_event_loop()
-        caps = await loop.run_in_executor(_thread_pool, lambda: mm.get_model_capabilities(req.model_id))
+        caps = await loop.run_in_executor(_thread_pool, lambda: mm.get_model_capabilities(req.model_id, allow_network=False))
         if not caps.get("vision", False):
             raise HTTPException(
                 status_code=400,

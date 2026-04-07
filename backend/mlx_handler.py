@@ -74,6 +74,30 @@ def get_backend_type() -> Optional[str]:
     return _backend_type
 
 
+def _load_with_backend(model_id: str, backend: str) -> tuple[Any, Any, Any, str]:
+    if backend == "lm":
+        logger.info("Importing mlx_lm.load for %s", model_id)
+        from mlx_lm import load as lm_load
+
+        logger.info("Calling mlx_lm.load for %s", model_id)
+        model, tokenizer = lm_load(model_id)
+        logger.info("mlx_lm.load completed for %s", model_id)
+        return model, tokenizer, None, "lm"
+
+    logger.info("Importing mlx_vlm.load for %s", model_id)
+    from mlx_vlm import load as vlm_load
+    logger.info("Importing mlx_vlm.utils.load_config for %s", model_id)
+    from mlx_vlm.utils import load_config
+
+    logger.info("Calling mlx_vlm.load for %s", model_id)
+    model, processor = vlm_load(model_id)
+    logger.info("mlx_vlm.load completed for %s", model_id)
+    logger.info("Calling mlx_vlm.utils.load_config for %s", model_id)
+    config = load_config(model_id)
+    logger.info("load_config completed for %s", model_id)
+    return model, processor, config, "vlm"
+
+
 def load_model(model_id: str, backend: Optional[str] = None) -> None:
     """Load a model. Blocks until done. Raises on error."""
     global _current_model_id, _model, _processor, _config, _backend_type, _load_status
@@ -97,49 +121,37 @@ def load_model(model_id: str, backend: Optional[str] = None) -> None:
         try:
             selected_backend = backend or "vlm"
             logger.info("Beginning model load: model_id=%s backend=%s", model_id, selected_backend)
+            backend_order = [selected_backend]
+            fallback_backend = "lm" if selected_backend == "vlm" else "vlm"
+            if fallback_backend not in backend_order:
+                backend_order.append(fallback_backend)
 
-            if selected_backend == "lm":
-                logger.info("Importing mlx_lm.load for %s", model_id)
-                from mlx_lm import load as lm_load
+            errors: List[str] = []
+            for idx, candidate_backend in enumerate(backend_order):
+                if idx > 0:
+                    logger.warning(
+                        "Primary backend failed for %s; retrying with %s",
+                        model_id, candidate_backend,
+                    )
+                    _release_runtime_memory()
 
-                logger.info("Calling mlx_lm.load for %s", model_id)
-                model, tokenizer = lm_load(model_id)
-                logger.info("mlx_lm.load completed for %s", model_id)
-                _model = model
-                _processor = tokenizer
-                _config = None
-                _backend_type = "lm"
-            else:
-                logger.info("Importing mlx_vlm.load for %s", model_id)
                 try:
-                    from mlx_vlm import load as vlm_load
-                    logger.info("Importing mlx_vlm.utils.load_config for %s", model_id)
-                    from mlx_vlm.utils import load_config
-
-                    logger.info("Calling mlx_vlm.load for %s", model_id)
-                    model, processor = vlm_load(model_id)
-                    logger.info("mlx_vlm.load completed for %s", model_id)
-                    logger.info("Calling mlx_vlm.utils.load_config for %s", model_id)
-                    config = load_config(model_id)
-                    logger.info("load_config completed for %s", model_id)
+                    model, processor, config, resolved_backend = _load_with_backend(model_id, candidate_backend)
                     _model = model
                     _processor = processor
                     _config = config
-                    _backend_type = "vlm"
-                except Exception as vlm_err:
+                    _backend_type = resolved_backend
+                    break
+                except Exception as load_err:
                     logger.warning(
-                        "mlx_vlm failed to load %s (%s); retrying with mlx_lm",
-                        model_id, vlm_err,
+                        "Backend %s failed to load %s: %s",
+                        candidate_backend,
+                        model_id,
+                        load_err,
                     )
-                    _release_runtime_memory()
-                    from mlx_lm import load as lm_load
-                    logger.info("Calling mlx_lm.load (fallback) for %s", model_id)
-                    model, tokenizer = lm_load(model_id)
-                    logger.info("mlx_lm.load (fallback) completed for %s", model_id)
-                    _model = model
-                    _processor = tokenizer
-                    _config = None
-                    _backend_type = "lm"
+                    errors.append(f"{candidate_backend}: {load_err}")
+            else:
+                raise RuntimeError(" ; ".join(errors) if errors else "No compatible backend could load the model.")
 
             _current_model_id = model_id
             _load_status = {

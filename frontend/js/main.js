@@ -5,6 +5,7 @@
 
 import { initChat, loadConversationList, startNewConversation } from "./chat.js";
 import { initModels } from "./models.js";
+import { initUpdates } from "./updates.js";
 
 // ── Global state ──────────────────────────────────────────────────────────────
 export const state = {
@@ -69,6 +70,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Init modules
   await initChat();
+  await initUpdates();
   await loadConversationList();
 
   // Poll model load status periodically

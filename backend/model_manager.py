@@ -30,6 +30,11 @@ _download_lock = threading.Lock()
 _cancel_events: Dict[str, threading.Event] = {}
 _DOWNLOAD_STATE_FILE = cfg.APP_DIR / "active_downloads.json"
 _recovery_ran = False
+_META_CACHE_FILE = cfg.APP_DIR / "model_metadata.json"
+_HF_TIMEOUT_S = 2.5
+_HF_BACKOFF_S = 60.0
+_hf_backoff_until = 0.0
+_hf_backoff_lock = threading.Lock()
 
 # Small LRU-style cache for individual model sizes (usedStorage)
 _size_cache: Dict[str, Optional[float]] = {}
@@ -197,64 +202,146 @@ def _estimate_size_gb(name: str) -> Optional[float]:
     return round(size_gb, 1)
 
 
+def _read_meta_cache_file() -> Dict[str, Dict[str, Any]]:
+    try:
+        if not _META_CACHE_FILE.exists():
+            return {}
+        data = json.loads(_META_CACHE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.debug("Failed reading model metadata cache", exc_info=True)
+        return {}
+
+
+def _write_meta_cache_file(data: Dict[str, Dict[str, Any]]) -> None:
+    tmp_path = _META_CACHE_FILE.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(_META_CACHE_FILE)
+
+
+def _read_cached_meta(model_id: str) -> Dict[str, Any]:
+    data = _read_meta_cache_file()
+    cached = data.get(model_id)
+    return cached if isinstance(cached, dict) else {}
+
+
+def _persist_meta(model_id: str, **updates: Any) -> None:
+    try:
+        data = _read_meta_cache_file()
+        current = data.get(model_id)
+        if not isinstance(current, dict):
+            current = {}
+        current.update(updates)
+        current["updated_at"] = time.time()
+        data[model_id] = current
+        _write_meta_cache_file(data)
+    except Exception:
+        logger.debug("Failed persisting metadata cache for %s", model_id, exc_info=True)
+
+
+def _hf_request_allowed() -> bool:
+    with _hf_backoff_lock:
+        return time.time() >= _hf_backoff_until
+
+
+def _mark_hf_failure() -> None:
+    global _hf_backoff_until
+    with _hf_backoff_lock:
+        _hf_backoff_until = time.time() + _HF_BACKOFF_S
+
+
+def _mark_hf_success() -> None:
+    global _hf_backoff_until
+    with _hf_backoff_lock:
+        _hf_backoff_until = 0.0
+
+
+def _hf_get_json(path: str, params: Any) -> Optional[Any]:
+    if not _hf_request_allowed():
+        return None
+
+    import requests
+
+    try:
+        resp = requests.get(
+            path,
+            params=params,
+            timeout=_HF_TIMEOUT_S,
+            headers={"User-Agent": "mlx-chat/1.0"},
+        )
+        resp.raise_for_status()
+        _mark_hf_success()
+        return resp.json()
+    except Exception:
+        _mark_hf_failure()
+        return None
+
+
 # ── Size cache + lazy fetch ───────────────────────────────────────────────────
 
-def fetch_model_size(model_id: str) -> Optional[float]:
+def fetch_model_size(model_id: str, allow_network: bool = True) -> Optional[float]:
     """Fetch exact model size (GB) via the HF individual model endpoint."""
     if model_id in _size_cache:
         return _size_cache[model_id]
 
-    import requests
+    cached_meta = _read_cached_meta(model_id)
+    cached_size = cached_meta.get("size_gb")
+    if isinstance(cached_size, (int, float)) and cached_size > 0:
+        size = round(float(cached_size), 2)
+        _size_cache[model_id] = size
+        return size
+
+    if not allow_network:
+        return None
+
     size = None
-    try:
-        resp = requests.get(
-            f"{_HF_API}/{model_id}",
-            params={"expand[]": "usedStorage"},
-            timeout=8,
-            headers={"User-Agent": "mlx-chat/1.0"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
+    data = _hf_get_json(f"{_HF_API}/{model_id}", {"expand[]": "usedStorage"})
+    if isinstance(data, dict):
         used = data.get("usedStorage")
         if used and used > 0:
             size = round(used / _GiB, 2)
-    except Exception:
-        pass
 
     if len(_size_cache) >= _SIZE_CACHE_MAX:
         del _size_cache[next(iter(_size_cache))]
     _size_cache[model_id] = size
+    if size is not None:
+        _persist_meta(model_id, size_gb=size)
     return size
 
 
-def get_model_capabilities(model_id: str) -> Dict[str, Any]:
+def get_model_capabilities(model_id: str, allow_network: bool = True) -> Dict[str, Any]:
     """Fetch model capabilities from HF metadata (cached)."""
     if model_id in _cap_cache:
         return _cap_cache[model_id]
 
-    import requests
-
     tags: List[str] = []
     pipeline_tag = None
     model_type = None
-    vision = False
+    cached_meta = _read_cached_meta(model_id)
+    cached_tags = cached_meta.get("tags")
+    if isinstance(cached_tags, list):
+        tags = [str(t) for t in cached_tags]
+    cached_pipeline = cached_meta.get("pipeline_tag")
+    if isinstance(cached_pipeline, str):
+        pipeline_tag = cached_pipeline
+    cached_model_type = cached_meta.get("model_type")
+    if isinstance(cached_model_type, str):
+        model_type = cached_model_type
 
-    try:
-        resp = requests.get(
-            f"{_HF_API}/{model_id}",
-            params={"expand[]": ["tags", "pipeline_tag", "config"]},
-            timeout=8,
-            headers={"User-Agent": "mlx-chat/1.0"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        tags = list(data.get("tags") or [])
-        pipeline_tag = data.get("pipeline_tag")
-        model_type = (data.get("config") or {}).get("model_type")
-        if pipeline_tag:
-            tags.append(str(pipeline_tag))
-    except Exception:
-        pass
+    if allow_network:
+        data = _hf_get_json(f"{_HF_API}/{model_id}", {"expand[]": ["tags", "pipeline_tag", "config"]})
+        if isinstance(data, dict):
+            tags = list(data.get("tags") or [])
+            pipeline_tag = data.get("pipeline_tag")
+            model_type = (data.get("config") or {}).get("model_type")
+            if pipeline_tag:
+                tags.append(str(pipeline_tag))
+            _persist_meta(
+                model_id,
+                tags=tags,
+                pipeline_tag=pipeline_tag,
+                model_type=model_type,
+            )
 
     vision = _has_vision(tags, model_id)
     compat = _compatibility_from_model_type(model_type)
@@ -450,7 +537,7 @@ def list_local_models() -> List[Dict[str, Any]]:
         size_gb = repo.size_on_disk / _GiB
         # Local cards should use the same capability detection as browse cards.
         # Fall back to name-based heuristic if metadata is unavailable.
-        caps = get_model_capabilities(repo.repo_id)
+        caps = get_model_capabilities(repo.repo_id, allow_network=False)
         vision = bool(caps.get("vision", False)) or _has_vision([], repo.repo_id)
         results.append({
             "id":        repo.repo_id,
@@ -515,8 +602,6 @@ SORT_OPTIONS = {
 
 
 def search_models(query: str = "", sort: str = "downloads", limit: int = 30) -> List[Dict[str, Any]]:
-    import requests
-
     hf_sort = SORT_OPTIONS.get(sort, "downloads")
     params = [
         ("author",    MLX_ORG),
@@ -534,16 +619,8 @@ def search_models(query: str = "", sort: str = "downloads", limit: int = 30) -> 
     if query:
         params.append(("search", query))
 
-    try:
-        resp = requests.get(
-            _HF_API, params=params, timeout=15,
-            headers={"User-Agent": "mlx-chat/1.0"},
-        )
-        resp.raise_for_status()
-        raw = resp.json()
-        if not isinstance(raw, list):
-            return []
-    except Exception:
+    raw = _hf_get_json(_HF_API, params)
+    if not isinstance(raw, list):
         return []
 
     results = []

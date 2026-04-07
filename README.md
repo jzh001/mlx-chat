@@ -9,6 +9,7 @@ A lightweight, professional chat UI for running `mlx-community` vision-language 
 - **Professional chat UI** – ChatGPT-style dark theme with full Markdown, LaTeX (KaTeX), and syntax-highlighted code rendering
 - **Streaming responses** – tokens appear in real-time as the model generates them
 - **Model management** – browse, download, and delete `mlx-community` models directly in the app
+- **In-app updates** – check GitHub releases, download the latest `.app.zip`, and restart into the update
 - **GPU compatibility labels** – each model shows whether it fits fully in RAM, partially, or is too large for your Mac
 - **Per-model settings** – temperature, top-p, max tokens, repetition penalty, system prompt, all saved automatically per model
 - **TurboQuant** – toggle KV-cache quantisation for reduced memory usage during long conversations
@@ -73,6 +74,8 @@ bash build_mac.sh
 ```
 
 The resulting `dist/MLX Chat.app` can be zipped and shared.
+
+Update note: the app version is read from the repo-root `VERSION` file (or `MLX_CHAT_VERSION`). Bump that value before creating a release build so in-app update checks compare against the correct installed version.
 
 ---
 

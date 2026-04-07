@@ -15,6 +15,7 @@ pyinstaller_args=(
   --clean
   --noconfirm
   --add-data "frontend:frontend"
+  --add-data "VERSION:."
   --hidden-import "uvicorn.logging"
   --hidden-import "uvicorn.loops.auto"
   --hidden-import "uvicorn.protocols.http.auto"
