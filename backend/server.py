@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+import sys
 from time import monotonic
 from typing import Any, Dict, List, Optional
 
@@ -28,7 +29,15 @@ from . import config as cfg
 from . import mlx_handler as mlx
 from . import model_manager as mm
 
-FRONTEND_DIR = Path(__file__).parent.parent / "frontend"
+def _frontend_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass) / "frontend"
+    return Path(__file__).parent.parent / "frontend"
+
+
+FRONTEND_DIR = _frontend_dir()
 logger = logging.getLogger("mlx_chat.server")
 
 app = FastAPI(title="MLX Chat")
@@ -128,7 +137,7 @@ def download_status(model_id: str):
     try:
         status = mm.get_download_status(model_id)
         if status is None:
-            return {"progress": 0.0, "done": False, "error": None, "current_file": ""}
+            return {"progress": 0.0, "done": True, "error": "Download state was lost. Please retry.", "current_file": ""}
         return status
     except Exception:
         return {"progress": 0.0, "done": True, "error": "Status unavailable.", "current_file": ""}

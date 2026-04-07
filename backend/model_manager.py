@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional
 
 import psutil
 
+from . import config as cfg
+
 MLX_ORG = "mlx-community"
 _GiB = 1024 ** 3  # bytes → gibibytes (matches Apple's "GB" labelling)
 _HF_API  = "https://huggingface.co/api/models"
@@ -26,6 +28,8 @@ _HF_API  = "https://huggingface.co/api/models"
 _download_status: Dict[str, Dict] = {}
 _download_lock = threading.Lock()
 _cancel_events: Dict[str, threading.Event] = {}
+_DOWNLOAD_STATE_FILE = cfg.APP_DIR / "active_downloads.json"
+_recovery_ran = False
 
 # Small LRU-style cache for individual model sizes (usedStorage)
 _size_cache: Dict[str, Optional[float]] = {}
@@ -298,7 +302,132 @@ def _hf_cache_root() -> Path:
     return Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
 
 
+def _download_worker_cmd(model_id: str) -> List[str]:
+    root_dir = Path(__file__).resolve().parent.parent
+    app_entry = root_dir / "app.py"
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--download-worker", model_id]
+    return [sys.executable, str(app_entry), "--download-worker", model_id]
+
+
+def _read_download_state_file() -> Dict[str, Dict[str, Any]]:
+    try:
+        if not _DOWNLOAD_STATE_FILE.exists():
+            return {}
+        raw = json.loads(_DOWNLOAD_STATE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            return {}
+
+        state: Dict[str, Dict[str, Any]] = {}
+        now = time.time()
+        for model_id, meta in raw.items():
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            if not isinstance(meta, dict):
+                meta = {}
+            state[model_id] = {
+                "start_time": float(meta.get("start_time") or now),
+                "updated_at": float(meta.get("updated_at") or now),
+            }
+        return state
+    except Exception:
+        logger.warning("Failed to read persisted download state", exc_info=True)
+        return {}
+
+
+def _write_download_state_file(state: Dict[str, Dict[str, Any]]) -> None:
+    tmp_path = _DOWNLOAD_STATE_FILE.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    tmp_path.replace(_DOWNLOAD_STATE_FILE)
+
+
+def _persist_download_state() -> None:
+    with _download_lock:
+        active = {
+            model_id: {
+                "start_time": float(status.get("start_time") or time.time()),
+                "updated_at": float(status.get("last_update") or time.time()),
+            }
+            for model_id, status in _download_status.items()
+            if not status.get("done")
+        }
+
+    try:
+        if active:
+            _write_download_state_file(active)
+        elif _DOWNLOAD_STATE_FILE.exists():
+            _DOWNLOAD_STATE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        logger.warning("Failed to persist download state", exc_info=True)
+
+
+def _is_suspicious_partial_repo_dir(model_id: str) -> bool:
+    safe = model_id.replace("/", "--")
+    repo_dir = _hf_cache_root() / f"models--{safe}"
+    if not repo_dir.exists():
+        return False
+
+    try:
+        for path in repo_dir.rglob("*"):
+            if path.name.endswith(".incomplete"):
+                return True
+    except Exception:
+        logger.debug("Failed scanning %s for incomplete files", model_id, exc_info=True)
+
+    try:
+        total_bytes = 0
+        file_count = 0
+        for path in repo_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            file_count += 1
+            try:
+                total_bytes += path.stat().st_size
+            except OSError:
+                continue
+        if total_bytes <= 0:
+            return True
+        if file_count <= 2 and total_bytes < 1_000_000:
+            return True
+    except Exception:
+        logger.debug("Failed sizing recovered repo dir for %s", model_id, exc_info=True)
+
+    return False
+
+
+def _recover_interrupted_downloads() -> None:
+    global _recovery_ran
+    with _download_lock:
+        if _recovery_ran:
+            return
+        _recovery_ran = True
+
+    persisted = _read_download_state_file()
+    if not persisted:
+        return
+
+    for model_id in persisted:
+        try:
+            if _is_suspicious_partial_repo_dir(model_id):
+                logger.info("Cleaning interrupted partial download: %s", model_id)
+                _cleanup_partial_download(model_id, delay_s=0.0)
+            else:
+                logger.info("Recovered persisted download state for %s without cleanup", model_id)
+        except Exception:
+            logger.warning("Failed recovering interrupted download for %s", model_id, exc_info=True)
+
+    try:
+        if _DOWNLOAD_STATE_FILE.exists():
+            _DOWNLOAD_STATE_FILE.unlink()
+    except Exception:
+        logger.warning("Failed to clear persisted download state", exc_info=True)
+
+
 def list_local_models() -> List[Dict[str, Any]]:
+    _recover_interrupted_downloads()
+
     # Exclude models that are currently being downloaded (partial cache)
     with _download_lock:
         downloading = {mid for mid, s in _download_status.items() if not s.get("done")}
@@ -315,6 +444,9 @@ def list_local_models() -> List[Dict[str, Any]]:
             continue
         if repo.repo_id in downloading:
             continue  # Skip partial downloads
+        if repo.size_on_disk <= 0:
+            logger.info("Skipping zero-byte cached repo entry: %s", repo.repo_id)
+            continue
         size_gb = repo.size_on_disk / _GiB
         # Local cards should use the same capability detection as browse cards.
         # Fall back to name-based heuristic if metadata is unavailable.
@@ -471,6 +603,7 @@ _STALL_TIMEOUT_S    = 300   # 5 minutes without progress = stalled
 
 def get_active_downloads() -> List[Dict[str, Any]]:
     """Return all currently in-progress (not done) downloads."""
+    _recover_interrupted_downloads()
     with _download_lock:
         return [
             {"model_id": mid, **status}
@@ -481,9 +614,10 @@ def get_active_downloads() -> List[Dict[str, Any]]:
 
 def get_download_status(model_id: str) -> Optional[Dict]:
     try:
-        status = _download_status.get(model_id)
-        if status is None:
-            return None
+        with _download_lock:
+            status = _download_status.get(model_id)
+            if status is None:
+                return None
 
         # Detect stall / global timeout on every poll
         if not status["done"]:
@@ -495,12 +629,15 @@ def get_download_status(model_id: str) -> Optional[Dict]:
                 with _download_lock:
                     _download_status[model_id]["done"]  = True
                     _download_status[model_id]["error"] = "Download timed out after 30 minutes."
+                _persist_download_state()
             elif stalled:
                 with _download_lock:
                     _download_status[model_id]["done"]  = True
                     _download_status[model_id]["error"] = "Download stalled (no progress for 5 minutes)."
+                _persist_download_state()
 
-        return dict(_download_status[model_id])
+        with _download_lock:
+            return dict(_download_status[model_id])
     except Exception:
         return {"progress": 0.0, "done": True, "error": "Status unavailable.", "current_file": ""}
 
@@ -513,6 +650,7 @@ def cancel_download(model_id: str) -> bool:
             return False
         _download_status[model_id]["done"] = True
         _download_status[model_id]["error"] = "Cancelled by user."
+    _persist_download_state()
 
     ev = _cancel_events.get(model_id)
     if ev:
@@ -523,9 +661,10 @@ def cancel_download(model_id: str) -> bool:
     return True
 
 
-def _cleanup_partial_download(model_id: str) -> None:
+def _cleanup_partial_download(model_id: str, delay_s: float = 2.0) -> None:
     """Delete partially downloaded model files from HF cache."""
-    time.sleep(2)  # Give the subprocess time to exit after kill()
+    if delay_s > 0:
+        time.sleep(delay_s)  # Give the subprocess time to exit after kill()
     # Try the huggingface_hub cache deletion first
     try:
         delete_local_model(model_id)
@@ -543,6 +682,10 @@ def _cleanup_partial_download(model_id: str) -> None:
 
 
 def start_download(model_id: str) -> None:
+    _recover_interrupted_downloads()
+    if _is_suspicious_partial_repo_dir(model_id):
+        _cleanup_partial_download(model_id, delay_s=0.0)
+
     with _download_lock:
         existing = _download_status.get(model_id)
         if existing and not existing.get("done"):
@@ -558,6 +701,7 @@ def start_download(model_id: str) -> None:
             "total_bytes":  0,
             "bytes_done":   0,
         }
+    _persist_download_state()
 
     cancel_ev = threading.Event()
     _cancel_events[model_id] = cancel_ev
@@ -707,7 +851,7 @@ def _download_worker(model_id: str, cancel_ev: threading.Event) -> None:
     which truly stops any in-progress HTTP transfer — no waiting for the current file.
     """
     proc = subprocess.Popen(
-        [sys.executable, "-c", _DOWNLOAD_SCRIPT, model_id],
+        _download_worker_cmd(model_id),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,  # suppress huggingface_hub tqdm output
         text=True,
@@ -756,6 +900,7 @@ def _download_worker(model_id: str, cancel_ev: threading.Event) -> None:
                         _download_status[model_id]["done"]  = True
                         _download_status[model_id]["error"] = data["error"]
                         _download_status[model_id]["last_update"] = time.time()
+                _persist_download_state()
                 break
 
             with _download_lock:
@@ -781,6 +926,7 @@ def _download_worker(model_id: str, cancel_ev: threading.Event) -> None:
                     _download_status[model_id]["progress"]  = 1.0
                     _download_status[model_id]["done"]       = True
                     _download_status[model_id]["last_update"] = time.time()
+                _persist_download_state()
                 break
 
         proc.wait()
@@ -792,6 +938,7 @@ def _download_worker(model_id: str, cancel_ev: threading.Event) -> None:
                     _download_status[model_id]["done"]  = True
                     _download_status[model_id]["error"] = f"Download process exited unexpectedly (code {proc.returncode})."
                     _download_status[model_id]["last_update"] = time.time()
+            _persist_download_state()
 
     except Exception as e:
         try:
@@ -804,7 +951,21 @@ def _download_worker(model_id: str, cancel_ev: threading.Event) -> None:
                 _download_status[model_id]["done"]  = True
                 _download_status[model_id]["error"] = str(e)
                 _download_status[model_id]["last_update"] = time.time()
+        _persist_download_state()
     finally:
         _cancel_events.pop(model_id, None)
         if cancelled:
             threading.Thread(target=_cleanup_partial_download, args=(model_id,), daemon=True).start()
+        _persist_download_state()
+
+
+def run_download_worker_subprocess(model_id: str) -> int:
+    old_argv = list(sys.argv)
+    try:
+        sys.argv = [old_argv[0], model_id]
+        exec(_DOWNLOAD_SCRIPT, {"__name__": "__main__"})
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else 0
+    finally:
+        sys.argv = old_argv
+    return 0

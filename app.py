@@ -157,6 +157,10 @@ def main():
     _configure_logging()
     logger = logging.getLogger("mlx_chat")
 
+    if len(sys.argv) >= 3 and sys.argv[1] == "--download-worker":
+        from backend import model_manager as mm
+        sys.exit(mm.run_download_worker_subprocess(sys.argv[2]))
+
     if not _acquire_instance_lock():
         logger.warning("Another instance of MLX Chat is already running — exiting.")
         sys.exit(0)
