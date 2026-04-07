@@ -112,12 +112,26 @@ def start_download(req: DownloadRequest):
     return {"status": "started"}
 
 
+@app.post("/api/models/download/cancel")
+def cancel_download(req: DownloadRequest):
+    cancelled = mm.cancel_download(req.model_id)
+    return {"cancelled": cancelled}
+
+
+@app.get("/api/models/download/active")
+def active_downloads():
+    return mm.get_active_downloads()
+
+
 @app.get("/api/models/download/status")
 def download_status(model_id: str):
-    status = mm.get_download_status(model_id)
-    if status is None:
-        return {"progress": 0.0, "done": False, "error": None, "current_file": ""}
-    return status
+    try:
+        status = mm.get_download_status(model_id)
+        if status is None:
+            return {"progress": 0.0, "done": False, "error": None, "current_file": ""}
+        return status
+    except Exception:
+        return {"progress": 0.0, "done": True, "error": "Status unavailable.", "current_file": ""}
 
 
 @app.get("/api/models/size")

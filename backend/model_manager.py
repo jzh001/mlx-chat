@@ -2,9 +2,15 @@
 HuggingFace model management: list local, search, download, delete.
 All models are from the mlx-community organization.
 """
+import contextlib
+import json
+import logging
 import os
+import queue
 import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -19,6 +25,7 @@ _HF_API  = "https://huggingface.co/api/models"
 # Progress tracking for active downloads
 _download_status: Dict[str, Dict] = {}
 _download_lock = threading.Lock()
+_cancel_events: Dict[str, threading.Event] = {}
 
 # Small LRU-style cache for individual model sizes (usedStorage)
 _size_cache: Dict[str, Optional[float]] = {}
@@ -27,6 +34,7 @@ _SIZE_CACHE_MAX = 500
 # Capability cache (vision/text-only)
 _cap_cache: Dict[str, Dict[str, Any]] = {}
 _CAP_CACHE_MAX = 500
+logger = logging.getLogger("mlx_chat.model_manager")
 
 # ── Publisher detection ──────────────────────────────────────────────────────
 
@@ -291,6 +299,10 @@ def _hf_cache_root() -> Path:
 
 
 def list_local_models() -> List[Dict[str, Any]]:
+    # Exclude models that are currently being downloaded (partial cache)
+    with _download_lock:
+        downloading = {mid for mid, s in _download_status.items() if not s.get("done")}
+
     from huggingface_hub import scan_cache_dir
     try:
         cache = scan_cache_dir()
@@ -301,6 +313,8 @@ def list_local_models() -> List[Dict[str, Any]]:
     for repo in cache.repos:
         if not repo.repo_id.startswith(f"{MLX_ORG}/"):
             continue
+        if repo.repo_id in downloading:
+            continue  # Skip partial downloads
         size_gb = repo.size_on_disk / _GiB
         # Local cards should use the same capability detection as browse cards.
         # Fall back to name-based heuristic if metadata is unavailable.
@@ -321,20 +335,39 @@ def list_local_models() -> List[Dict[str, Any]]:
 
 def delete_local_model(model_id: str) -> bool:
     from huggingface_hub import scan_cache_dir
+    cache_logger = logging.getLogger("huggingface_hub.utils._cache_manager")
+
+    @contextlib.contextmanager
+    def _suppress_missing_repo_warnings():
+        previous_level = cache_logger.level
+        cache_logger.setLevel(logging.ERROR)
+        try:
+            yield
+        finally:
+            cache_logger.setLevel(previous_level)
+
     try:
-        cache = scan_cache_dir()
-        for repo in cache.repos:
-            if repo.repo_id == model_id:
-                strategy = cache.delete_revisions(*[r.commit_hash for r in repo.revisions])
-                strategy.execute()
-                return True
+        with _suppress_missing_repo_warnings():
+            cache = scan_cache_dir()
+            for repo in cache.repos:
+                if repo.repo_id == model_id:
+                    try:
+                        strategy = cache.delete_revisions(*[r.commit_hash for r in repo.revisions])
+                        strategy.execute()
+                        return True
+                    except FileNotFoundError:
+                        logger.debug("Model cache already removed during delete: %s", model_id)
+                        return True
     except Exception:
         pass
 
     safe = model_id.replace("/", "--")
     path = _hf_cache_root() / f"models--{safe}"
     if path.exists():
-        shutil.rmtree(path)
+        try:
+            shutil.rmtree(path)
+        except FileNotFoundError:
+            logger.debug("Model cache path already removed: %s", path)
         return True
     return False
 
@@ -436,27 +469,77 @@ _DOWNLOAD_TIMEOUT_S = 1800  # 30 minutes max per download
 _STALL_TIMEOUT_S    = 300   # 5 minutes without progress = stalled
 
 
+def get_active_downloads() -> List[Dict[str, Any]]:
+    """Return all currently in-progress (not done) downloads."""
+    with _download_lock:
+        return [
+            {"model_id": mid, **status}
+            for mid, status in _download_status.items()
+            if not status.get("done")
+        ]
+
+
 def get_download_status(model_id: str) -> Optional[Dict]:
-    status = _download_status.get(model_id)
-    if status is None:
-        return None
+    try:
+        status = _download_status.get(model_id)
+        if status is None:
+            return None
 
-    # Detect stall / global timeout on every poll
-    if not status["done"]:
-        now = time.time()
-        elapsed = now - status["start_time"]
-        stalled = now - status["last_update"] > _STALL_TIMEOUT_S
+        # Detect stall / global timeout on every poll
+        if not status["done"]:
+            now = time.time()
+            elapsed = now - status["start_time"]
+            stalled = now - status["last_update"] > _STALL_TIMEOUT_S
 
-        if elapsed > _DOWNLOAD_TIMEOUT_S:
-            with _download_lock:
-                _download_status[model_id]["done"]  = True
-                _download_status[model_id]["error"] = "Download timed out after 30 minutes."
-        elif stalled:
-            with _download_lock:
-                _download_status[model_id]["done"]  = True
-                _download_status[model_id]["error"] = "Download stalled (no progress for 5 minutes)."
+            if elapsed > _DOWNLOAD_TIMEOUT_S:
+                with _download_lock:
+                    _download_status[model_id]["done"]  = True
+                    _download_status[model_id]["error"] = "Download timed out after 30 minutes."
+            elif stalled:
+                with _download_lock:
+                    _download_status[model_id]["done"]  = True
+                    _download_status[model_id]["error"] = "Download stalled (no progress for 5 minutes)."
 
-    return dict(_download_status[model_id])
+        return dict(_download_status[model_id])
+    except Exception:
+        return {"progress": 0.0, "done": True, "error": "Status unavailable.", "current_file": ""}
+
+
+def cancel_download(model_id: str) -> bool:
+    """Cancel an in-progress download. Returns True if a download was cancelled."""
+    with _download_lock:
+        status = _download_status.get(model_id)
+        if not status or status.get("done"):
+            return False
+        _download_status[model_id]["done"] = True
+        _download_status[model_id]["error"] = "Cancelled by user."
+
+    ev = _cancel_events.get(model_id)
+    if ev:
+        ev.set()
+
+    # Clean up partial cache files after a short delay (worker may still be finishing a file)
+    threading.Thread(target=_cleanup_partial_download, args=(model_id,), daemon=True).start()
+    return True
+
+
+def _cleanup_partial_download(model_id: str) -> None:
+    """Delete partially downloaded model files from HF cache."""
+    time.sleep(2)  # Give the subprocess time to exit after kill()
+    # Try the huggingface_hub cache deletion first
+    try:
+        delete_local_model(model_id)
+    except Exception:
+        logger.debug("Best-effort partial download cleanup failed for %s", model_id, exc_info=True)
+    # Also nuke the raw cache directory — incomplete downloads leave temp files
+    # that scan_cache_dir() doesn't always surface via delete_revisions().
+    try:
+        safe = model_id.replace("/", "--")
+        model_dir = _hf_cache_root() / f"models--{safe}"
+        if model_dir.exists():
+            shutil.rmtree(model_dir, ignore_errors=True)
+    except Exception:
+        logger.debug("Raw cache cleanup failed for %s", model_id, exc_info=True)
 
 
 def start_download(model_id: str) -> None:
@@ -466,44 +549,262 @@ def start_download(model_id: str) -> None:
             return  # already in progress
         now = time.time()
         _download_status[model_id] = {
-            "progress":    0.0,
-            "done":        False,
-            "error":       None,
+            "progress":     0.0,
+            "done":         False,
+            "error":        None,
             "current_file": "",
-            "start_time":  now,
-            "last_update": now,
+            "start_time":   now,
+            "last_update":  now,
+            "total_bytes":  0,
+            "bytes_done":   0,
         }
 
-    t = threading.Thread(target=_download_worker, args=(model_id,), daemon=True)
+    cancel_ev = threading.Event()
+    _cancel_events[model_id] = cancel_ev
+    t = threading.Thread(target=_download_worker, args=(model_id, cancel_ev), daemon=True)
     t.start()
 
 
-def _download_worker(model_id: str) -> None:
+# Subprocess script that performs the actual download and reports JSON progress to stdout.
+# Runs in an isolated Python process so proc.kill() immediately terminates the download.
+# Within each file, a background thread polls the .incomplete file in the HF cache so
+# the host process receives smooth byte-level progress even for multi-GB shards.
+_DOWNLOAD_SCRIPT = r'''
+import os, sys, json, threading, time
+from pathlib import Path
+import requests
+from huggingface_hub import model_info, hf_hub_download
+from tqdm.auto import tqdm as _tqdm
+
+model_id = sys.argv[1]
+hf_home = os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+blobs_dir = Path(hf_home) / "hub" / ("models--" + model_id.replace("/", "--")) / "blobs"
+hf_api = "https://huggingface.co/api/models"
+total_bytes = 1
+current_file = ""
+current_file_start_bytes = 0
+
+def _blobs_size():
+    # Sum all files in the blobs directory (complete + in-progress).
+    # This works regardless of the .incomplete naming convention used by the
+    # installed huggingface_hub version.
     try:
-        from huggingface_hub import model_info, hf_hub_download
+        return sum(f.stat().st_size for f in blobs_dir.iterdir() if f.is_file())
+    except OSError:
+        return 0
 
-        info = model_info(model_id)
-        siblings = [s for s in info.siblings if s.rfilename]
-        total = max(len(siblings), 1)
+def _repo_total_bytes():
+    try:
+        resp = requests.get(
+            f"{hf_api}/{model_id}",
+            params={"expand[]": "usedStorage"},
+            timeout=8,
+            headers={"User-Agent": "mlx-chat/1.0"},
+        )
+        resp.raise_for_status()
+        used = (resp.json() or {}).get("usedStorage")
+        if used and used > 0:
+            return int(used)
+    except Exception:
+        pass
+    return 0
 
-        for i, sibling in enumerate(siblings):
-            with _download_lock:
-                if _download_status[model_id].get("done"):
-                    return  # cancelled / timed out
-                _download_status[model_id]["current_file"] = sibling.rfilename
-                _download_status[model_id]["progress"]     = i / total
-                _download_status[model_id]["last_update"]  = time.time()
+def _emit_progress(bytes_done, done=False):
+    safe_total = max(int(total_bytes), 1)
+    safe_done = max(0, min(int(bytes_done), safe_total))
+    payload = {
+        "progress": safe_done / safe_total,
+        "bytes_done": safe_done,
+        "total_bytes": safe_total,
+        "file": current_file,
+    }
+    if done:
+        payload["done"] = True
+    print(json.dumps(payload), flush=True)
 
+class JsonProgressTqdm(_tqdm):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("disable", True)
+        super().__init__(*args, **kwargs)
+        self._json_last_emit = 0.0
+
+    def display(self, *args, **kwargs):
+        return
+
+    def refresh(self, *args, **kwargs):
+        out = super().refresh(*args, **kwargs)
+        self._emit_json()
+        return out
+
+    def update(self, n=1):
+        out = super().update(n)
+        self._emit_json()
+        return out
+
+    def close(self):
+        self._emit_json(force=True)
+        return super().close()
+
+    def _emit_json(self, force=False):
+        now = time.time()
+        if not force and now - self._json_last_emit < 0.25:
+            return
+        self._json_last_emit = now
+        initial = int(getattr(self, "initial", 0) or 0)
+        current_n = int(getattr(self, "n", 0) or 0)
+        computed = current_file_start_bytes + max(0, current_n - initial)
+        effective = max(min(_blobs_size(), total_bytes), min(computed, total_bytes))
+        _emit_progress(effective)
+
+try:
+    info = model_info(model_id)
+    siblings = [s for s in info.siblings if s.rfilename]
+
+    total_bytes = _repo_total_bytes()
+    sizes = []
+    sibling_total = 0
+    for s in siblings:
+        sz = 0
+        if s.lfs is not None:
+            if hasattr(s.lfs, "size"):
+                sz = s.lfs.size or 0
+            elif isinstance(s.lfs, dict):
+                sz = s.lfs.get("size", 0) or 0
+        if not sz and s.size:
+            sz = s.size
+        sizes.append(sz)
+        sibling_total += sz
+    if total_bytes <= 0:
+        total_bytes = sibling_total
+    if total_bytes == 0:
+        total_bytes = max(len(siblings), 1)
+        sizes = [1] * len(siblings)
+
+    bytes_done = min(_blobs_size(), total_bytes)
+    _emit_progress(bytes_done)
+
+    for sibling, fsize in zip(siblings, sizes):
+        current_file = sibling.rfilename
+        current_file_start_bytes = min(_blobs_size(), total_bytes)
+        _emit_progress(current_file_start_bytes)
+        try:
+            hf_hub_download(repo_id=model_id, filename=sibling.rfilename, tqdm_class=JsonProgressTqdm)
+        except TypeError:
             hf_hub_download(repo_id=model_id, filename=sibling.rfilename)
 
-        with _download_lock:
-            _download_status[model_id]["progress"]    = 1.0
-            _download_status[model_id]["done"]        = True
-            _download_status[model_id]["last_update"] = time.time()
+        _emit_progress(min(_blobs_size(), total_bytes))
+
+    _emit_progress(total_bytes, done=True)
+except Exception as e:
+    print(json.dumps({"error": str(e)}), flush=True)
+    sys.exit(1)
+'''
+
+
+def _download_worker(model_id: str, cancel_ev: threading.Event) -> None:
+    """
+    Runs the download in a child process. On cancel, proc.kill() is called immediately,
+    which truly stops any in-progress HTTP transfer — no waiting for the current file.
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _DOWNLOAD_SCRIPT, model_id],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,  # suppress huggingface_hub tqdm output
+        text=True,
+        env=os.environ.copy(),
+    )
+
+    # Read stdout in a background thread so we can poll cancel_ev without blocking.
+    line_queue: queue.Queue = queue.Queue()
+
+    def _reader():
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line_queue.put(line)
+        line_queue.put(None)  # sentinel
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+    cancelled = False
+    try:
+        while True:
+            if cancel_ev.is_set():
+                cancelled = True
+                proc.kill()
+                proc.wait()
+                break
+
+            try:
+                line = line_queue.get(timeout=0.3)
+            except queue.Empty:
+                # Check if proc exited without more output
+                if proc.poll() is not None:
+                    break
+                continue
+
+            if line is None:
+                break
+
+            try:
+                data = json.loads(line.strip())
+            except (json.JSONDecodeError, ValueError):
+                continue
+
+            if data.get("error"):
+                with _download_lock:
+                    if model_id in _download_status and not _download_status[model_id].get("done"):
+                        _download_status[model_id]["done"]  = True
+                        _download_status[model_id]["error"] = data["error"]
+                        _download_status[model_id]["last_update"] = time.time()
+                break
+
+            with _download_lock:
+                if _download_status[model_id].get("done"):
+                    # cancel_download() was called externally
+                    cancelled = True
+                    proc.kill()
+                    proc.wait()
+                    break
+                st = _download_status[model_id]
+                if "total_bytes" in data:
+                    st["total_bytes"] = data["total_bytes"]
+                if "progress" in data:
+                    st["progress"] = data["progress"]
+                if "bytes_done" in data:
+                    st["bytes_done"] = data["bytes_done"]
+                if "file" in data:
+                    st["current_file"] = data["file"]
+                st["last_update"] = time.time()
+
+            if data.get("done"):
+                with _download_lock:
+                    _download_status[model_id]["progress"]  = 1.0
+                    _download_status[model_id]["done"]       = True
+                    _download_status[model_id]["last_update"] = time.time()
+                break
+
+        proc.wait()
+
+        # If the subprocess exited with an error but we didn't capture it above
+        if proc.returncode not in (0, -9, -15, None) and not cancelled:
+            with _download_lock:
+                if model_id in _download_status and not _download_status[model_id].get("done"):
+                    _download_status[model_id]["done"]  = True
+                    _download_status[model_id]["error"] = f"Download process exited unexpectedly (code {proc.returncode})."
+                    _download_status[model_id]["last_update"] = time.time()
 
     except Exception as e:
+        try:
+            proc.kill()
+            proc.wait()
+        except Exception:
+            pass
         with _download_lock:
-            if model_id in _download_status:
-                _download_status[model_id]["error"]       = str(e)
-                _download_status[model_id]["done"]        = True
+            if model_id in _download_status and not _download_status[model_id].get("done"):
+                _download_status[model_id]["done"]  = True
+                _download_status[model_id]["error"] = str(e)
                 _download_status[model_id]["last_update"] = time.time()
+    finally:
+        _cancel_events.pop(model_id, None)
+        if cancelled:
+            threading.Thread(target=_cleanup_partial_download, args=(model_id,), daemon=True).start()
